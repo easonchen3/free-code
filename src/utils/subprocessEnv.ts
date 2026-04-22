@@ -19,6 +19,14 @@ const GHA_SUBPROCESS_SCRUB = [
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_FOUNDRY_API_KEY',
   'ANTHROPIC_CUSTOM_HEADERS',
+  'OPENAI_COMPATIBLE_API_KEY',
+  'OPENAI_API_KEY',
+  'OPENAI_COMPATIBLE_CUSTOM_HEADERS',
+  'OPENAI_CUSTOM_HEADERS',
+  'OPENAI_COMPATIBLE_ORGANIZATION',
+  'OPENAI_ORGANIZATION',
+  'OPENAI_COMPATIBLE_PROJECT',
+  'OPENAI_PROJECT',
 
   // OTLP exporter headers — documented to carry Authorization=Bearer tokens
   // for monitoring backends; read in-process by OTEL SDK, subprocesses never need them

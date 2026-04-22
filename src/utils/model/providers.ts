@@ -1,7 +1,13 @@
 import type { AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS } from '../../services/analytics/index.js'
 import { isEnvTruthy } from '../envUtils.js'
 
-export type APIProvider = 'firstParty' | 'bedrock' | 'vertex' | 'foundry' | 'openai'
+export type APIProvider =
+  | 'firstParty'
+  | 'bedrock'
+  | 'vertex'
+  | 'foundry'
+  | 'openaiCompatible'
+  | 'openai'
 
 export function getAPIProvider(): APIProvider {
   return isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK)
@@ -10,13 +16,35 @@ export function getAPIProvider(): APIProvider {
       ? 'vertex'
       : isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY)
         ? 'foundry'
-        : isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENAI)
-          ? 'openai'
-          : 'firstParty'
+        : isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENAI_COMPATIBLE)
+          ? 'openaiCompatible'
+          : isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENAI)
+            ? 'openai'
+            : 'firstParty'
 }
 
 export function getAPIProviderForStatsig(): AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS {
   return getAPIProvider() as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS
+}
+
+export function hasCustomOpenAICompatibleConfig(): boolean {
+  return (
+    getAPIProvider() === 'openaiCompatible' &&
+    !!(
+      process.env.OPENAI_COMPATIBLE_API_KEY ||
+      process.env.OPENAI_API_KEY ||
+      process.env.OPENAI_COMPATIBLE_BASE_URL ||
+      process.env.OPENAI_BASE_URL ||
+      process.env.OPENAI_COMPATIBLE_CUSTOM_HEADERS ||
+      process.env.OPENAI_CUSTOM_HEADERS ||
+      process.env.OPENAI_COMPATIBLE_THINKING_TYPE ||
+      process.env.OPENAI_THINKING_TYPE ||
+      process.env.OPENAI_COMPATIBLE_ORGANIZATION ||
+      process.env.OPENAI_ORGANIZATION ||
+      process.env.OPENAI_COMPATIBLE_PROJECT ||
+      process.env.OPENAI_PROJECT
+    )
+  )
 }
 
 /**

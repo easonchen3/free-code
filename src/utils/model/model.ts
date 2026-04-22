@@ -69,11 +69,23 @@ export function getUserSpecifiedModelSetting(): ModelSetting | undefined {
     specifiedModel = modelOverride
   } else {
     const settings = getSettings_DEPRECATED() || {}
-    specifiedModel = process.env.ANTHROPIC_MODEL || settings.model || undefined
+    const openAICompatibleModel =
+      getAPIProvider() === 'openaiCompatible'
+        ? process.env.OPENAI_COMPATIBLE_MODEL ?? process.env.OPENAI_MODEL
+        : undefined
+    specifiedModel =
+      openAICompatibleModel ||
+      process.env.ANTHROPIC_MODEL ||
+      settings.model ||
+      undefined
   }
 
   // Ignore the user-specified model if it's not in the availableModels allowlist.
-  if (specifiedModel && !isModelAllowed(specifiedModel)) {
+  if (
+    specifiedModel &&
+    getAPIProvider() !== 'openaiCompatible' &&
+    !isModelAllowed(specifiedModel)
+  ) {
     return undefined
   }
 

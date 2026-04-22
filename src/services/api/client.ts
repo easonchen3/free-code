@@ -21,6 +21,7 @@ import { getUserAgent } from 'src/utils/http.js'
 import { getSmallFastModel } from 'src/utils/model/model.js'
 import {
   getAPIProvider,
+  hasCustomOpenAICompatibleConfig,
   isFirstPartyAnthropicBaseUrl,
 } from 'src/utils/model/providers.js'
 import { getProxyFetchOptions } from 'src/utils/proxy.js'
@@ -36,6 +37,7 @@ import {
   isEnvTruthy,
 } from '../../utils/envUtils.js'
 import { createCodexFetch } from './codex-fetch-adapter.js'
+import { createOpenAIChatCompletionsFetch } from './openai-fetch-adapter.js'
 
 /**
  * Environment variables for different client types:
@@ -306,6 +308,33 @@ export async function getAnthropicClient({
   }
 
   // ── Codex (OpenAI) provider via fetch adapter ─────────────────────
+  if (getAPIProvider() === 'openaiCompatible') {
+    if (!hasCustomOpenAICompatibleConfig()) {
+      throw new Error(
+        'OpenAI-compatible provider requires OPENAI_COMPATIBLE_API_KEY or OPENAI_API_KEY.',
+      )
+    }
+
+    const openAICompatibleApiKey =
+      process.env.OPENAI_COMPATIBLE_API_KEY ?? process.env.OPENAI_API_KEY
+    if (!openAICompatibleApiKey) {
+      throw new Error(
+        'Missing OpenAI-compatible API key. Set OPENAI_COMPATIBLE_API_KEY or OPENAI_API_KEY.',
+      )
+    }
+
+    const openAIFetch = createOpenAIChatCompletionsFetch(
+      openAICompatibleApiKey,
+    )
+    const clientConfig: ConstructorParameters<typeof Anthropic>[0] = {
+      apiKey: 'openai-compatible-placeholder',
+      ...ARGS,
+      fetch: openAIFetch as unknown as typeof globalThis.fetch,
+      ...(isDebugToStdErr() && { logger: createStderrLogger() }),
+    }
+    return new Anthropic(clientConfig)
+  }
+
   if (isCodexSubscriber()) {
     const codexTokens = getCodexOAuthTokens()
     if (codexTokens?.accessToken) {

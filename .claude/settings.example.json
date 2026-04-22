@@ -1,0 +1,11 @@
+{
+  "model": "your-model-id",
+  "env": {
+    "CLAUDE_CODE_USE_OPENAI_COMPATIBLE": "1",
+    "OPENAI_COMPATIBLE_API_KEY": "your-api-key",
+    "OPENAI_COMPATIBLE_BASE_URL": "https://your-host/v1",
+    "OPENAI_COMPATIBLE_MODEL": "your-model-id",
+    "OPENAI_COMPATIBLE_THINKING_TYPE": "enabled",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "256"
+  }
+}

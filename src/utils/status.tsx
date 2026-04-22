@@ -240,11 +240,14 @@ export function buildAccountProperties(): Property[] {
 export function buildAPIProviderProperties(): Property[] {
   const apiProvider = getAPIProvider();
   const properties: Property[] = [];
+  const openAICompatibleThinkingType = (process.env.OPENAI_COMPATIBLE_THINKING_TYPE ?? process.env.OPENAI_THINKING_TYPE)?.trim().toLowerCase();
   if (apiProvider !== 'firstParty') {
     const providerLabel = {
       bedrock: 'AWS Bedrock',
       vertex: 'Google Vertex AI',
-      foundry: 'Microsoft Foundry'
+      foundry: 'Microsoft Foundry',
+      openaiCompatible: 'OpenAI-compatible API',
+      openai: 'Codex / OpenAI'
     }[apiProvider];
     properties.push({
       label: 'API provider',
@@ -320,6 +323,18 @@ export function buildAPIProviderProperties(): Property[] {
         value: 'Microsoft Foundry auth skipped'
       });
     }
+  } else if (apiProvider === 'openaiCompatible') {
+    const openAICompatibleBaseUrl = process.env.OPENAI_COMPATIBLE_BASE_URL ?? process.env.OPENAI_BASE_URL;
+    if (openAICompatibleBaseUrl) {
+      properties.push({
+        label: 'OpenAI-compatible base URL',
+        value: openAICompatibleBaseUrl
+      });
+    }
+    properties.push({
+      label: 'OpenAI-compatible thinking',
+      value: openAICompatibleThinkingType === 'enabled' ? 'Enabled' : openAICompatibleThinkingType === 'disabled' ? 'Disabled' : 'Not configured'
+    });
   }
   const proxyUrl = getProxyUrl();
   if (proxyUrl) {

@@ -28,7 +28,10 @@ export async function validateModel(
   }
 
   // Check against availableModels allowlist before any API call
-  if (!isModelAllowed(normalizedModel)) {
+  if (
+    getAPIProvider() !== 'openaiCompatible' &&
+    !isModelAllowed(normalizedModel)
+  ) {
     return {
       valid: false,
       error: `Model '${normalizedModel}' is not in the list of available models`,
