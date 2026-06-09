@@ -31,8 +31,8 @@ const uuidRegex =
 
 /**
  * 校验并收窄 UUID 字符串。
- * 1. 非字符串直接返回 null。
- * 2. 字符串通过 UUID 正则后，才作为 UUID 类型返回。
+ *
+ * 该方法用于在定位 session 文件前过滤非法 sessionId，避免把普通字符串当成文件名继续处理。
  */
 export function validateUuid(maybeUuid: unknown): UUID | null {
   if (typeof maybeUuid !== 'string') return null
@@ -45,9 +45,8 @@ export function validateUuid(maybeUuid: unknown): UUID | null {
 
 /**
  * 反转义从 JSON 文本中截取出的字符串字段。
- * 1. 没有反斜杠时直接返回，避免不必要的字符串分配。
- * 2. 有转义字符时交给 JSON.parse 处理标准 JSON 转义。
- * 3. 如果内容被截断导致解析失败，则返回原文，保证调用方不会崩溃。
+ *
+ * 该方法服务于轻量 JSONL 文本扫描，保证截取出来的字段尽量还原成用户可读内容。
  */
 export function unescapeJsonString(raw: string): string {
   // 1. 没有反斜杠说明不存在 JSON 转义，直接返回原字符串，避免额外分配。
@@ -63,9 +62,8 @@ export function unescapeJsonString(raw: string): string {
 
 /**
  * 从原始文本中提取第一个简单 JSON 字符串字段值。
- * 1. 同时兼容 `"key":"value"` 和 `"key": "value"` 两种空格写法。
- * 2. 找到字段开头后逐字符扫描，跳过被反斜杠转义的引号。
- * 3. 遇到未转义的结束引号后返回反转义后的字段值。
+ *
+ * 该方法用于从可能不完整的 JSONL 片段中快速读取字段，避免为了列表展示解析完整 JSON。
  */
 export function extractJsonStringField(
   text: string,
@@ -98,9 +96,8 @@ export function extractJsonStringField(
 
 /**
  * 从原始文本中提取最后一个简单 JSON 字符串字段值。
- * 1. 对每种字段格式从头开始反复查找。
- * 2. 每次找到合法值后覆盖 lastValue。
- * 3. 扫描完成后返回最后一次出现的字段值，适合 customTitle、tag 等追加字段。
+ *
+ * 该方法适合读取会被后续记录覆盖或追加的元数据，例如标题和标签。
  */
 export function extractLastJsonStringField(
   text: string,
@@ -154,11 +151,8 @@ const COMMAND_NAME_RE = /<command-name>(.*?)<\/command-name>/
 
 /**
  * 从 JSONL 文件头部片段中提取第一条有意义的用户提示词。
- * 1. 逐行扫描 head，只处理 type=user 的 JSONL 行。
- * 2. 跳过 tool_result、isMeta、isCompactSummary 等非真实用户输入。
- * 3. 支持字符串 content 和 text block 数组两种消息结构。
- * 4. slash command 默认跳过，但记住第一个命令名作为兜底。
- * 5. bash 输入转成 `! command` 展示，其它长文本截断到 200 字符。
+ *
+ * 该方法用于 session 列表或恢复入口展示更接近用户意图的会话摘要。
  */
 export function extractFirstPromptFromHead(head: string): string {
   let start = 0
@@ -240,9 +234,8 @@ export function extractFirstPromptFromHead(head: string): string {
 
 /**
  * 读取文件头部和尾部各 LITE_READ_BUF_SIZE 字节。
- * 1. 使用调用方传入的共享 Buffer，减少批量读取 session 列表时的分配成本。
- * 2. 小文件只读一次，此时 tail 与 head 相同。
- * 3. 任何文件错误都返回空 head/tail，让上层继续处理其它 session。
+ *
+ * 该方法用于批量读取 session 列表时获取必要元数据，避免加载完整 transcript。
  */
 export async function readHeadAndTail(
   filePath: string,
@@ -295,9 +288,8 @@ export type LiteSessionFile = {
 
 /**
  * 打开单个 session 文件，并在同一个 fd 上读取 stat、head 和 tail。
- * 1. 每次调用独立分配 Buffer，适合 Promise.all 并发读取。
- * 2. 先 stat 再读头尾，避免调用方重复 stat。
- * 3. 任何错误或空文件都返回 null，表示该 session 文件不可用。
+ *
+ * 该方法返回 session 列表展示所需的最小文件信息，不可用文件以 null 表示。
  */
 export async function readSessionLite(
   filePath: string,
@@ -344,8 +336,8 @@ export const MAX_SANITIZED_LENGTH = 200
 
 /**
  * 在没有 Bun.hash 的 Node 环境中生成稳定短 hash。
- * 1. 使用共享 djb2Hash 保持实现轻量。
- * 2. 取绝对值并转成 36 进制，缩短路径后缀长度。
+ *
+ * 该方法用于保证路径清洗在纯 Node 运行环境中仍能生成稳定后缀。
  */
 function simpleHash(str: string): string {
   return Math.abs(djb2Hash(str)).toString(36)
@@ -353,9 +345,8 @@ function simpleHash(str: string): string {
 
 /**
  * 把任意字符串清洗成可作为目录名或文件名的安全片段。
- * 1. 将所有非字母数字字符替换为连字符，兼容 Windows 冒号等保留字符限制。
- * 2. 长度未超过 MAX_SANITIZED_LENGTH 时直接返回清洗结果。
- * 3. 超长路径会截断并追加 hash，既避开文件系统限制，也尽量保持唯一性。
+ *
+ * 该方法用于把真实项目路径映射到跨平台可用的 session 存储目录名。
  */
 export function sanitizePath(name: string): string {
   // 1. 路径、插件名、server 名都可能包含平台保留字符，统一替换成连字符。
@@ -377,8 +368,8 @@ export function sanitizePath(name: string): string {
 
 /**
  * 返回 Claude 配置目录下的 projects 根目录。
- * 1. 先通过 envUtils 获取用户配置根目录。
- * 2. 再拼接 projects，得到所有项目 session 的统一存放目录。
+ *
+ * 该目录是所有项目 session JSONL 文件的统一上级目录。
  */
 export function getProjectsDir(): string {
   return join(getClaudeConfigHomeDir(), 'projects')
@@ -386,8 +377,8 @@ export function getProjectsDir(): string {
 
 /**
  * 根据真实项目路径计算对应的 session 项目目录。
- * 1. 使用 sanitizePath 将项目路径转换为文件系统安全片段。
- * 2. 拼到 projects 根目录下，得到该项目的 JSONL 存储目录。
+ *
+ * 该方法用于把当前工作目录稳定映射到对应的 session 文件夹。
  */
 export function getProjectDir(projectDir: string): string {
   return join(getProjectsDir(), sanitizePath(projectDir))
@@ -395,9 +386,8 @@ export function getProjectDir(projectDir: string): string {
 
 /**
  * 将目录路径规范化为稳定的项目路径。
- * 1. 优先 realpath 解析符号链接，保证同一目录不会生成多个 session 项目目录。
- * 2. 对路径做 NFC 归一化，避免不同 Unicode 组合形式导致目录不一致。
- * 3. realpath 失败时回退到原始路径的 NFC 归一化，兼容目录尚未创建的场景。
+ *
+ * 该方法用于减少符号链接和 Unicode 表示差异带来的 session 目录重复。
  */
 export async function canonicalizePath(dir: string): Promise<string> {
   try {
@@ -411,9 +401,8 @@ export async function canonicalizePath(dir: string): Promise<string> {
 
 /**
  * 查找某个项目路径对应的 session 项目目录。
- * 1. 先按当前运行环境的 sanitizePath 结果尝试精确匹配。
- * 2. 短路径精确匹配失败即可认为没有 session。
- * 3. 长路径可能因为 Bun.hash 和 Node simpleHash 后缀不同导致不一致，因此回退到前缀扫描。
+ *
+ * 该方法兼容不同运行时生成的长路径 hash 后缀，尽量找到已有 session 目录。
  */
 export async function findProjectDir(
   projectPath: string,
@@ -449,11 +438,8 @@ export async function findProjectDir(
 
 /**
  * 将 sessionId 解析为磁盘上的 JSONL 文件路径。
- * 1. 传入 dir 时，先规范化项目路径，再查找该项目的 session 目录。
- * 2. 当前项目没找到时，继续扫描同一 git 仓库的其它 worktree 根目录。
- * 3. 未传入 dir 时，扫描 ~/.claude/projects/ 下所有项目目录。
- * 4. 只返回 size > 0 的文件，避免把空的或截断的 session 当成有效结果。
- * 5. 返回 fileSize，避免调用方在加载正文前再次 stat。
+ *
+ * 该方法用于 resume/load 场景定位有效 session，并返回后续读取 transcript 所需的文件大小。
  */
 export async function resolveSessionFilePath(
   sessionId: string,
@@ -545,8 +531,8 @@ export const SKIP_PRECOMPACT_THRESHOLD = 5 * 1024 * 1024
 let _compactBoundaryMarker: Buffer | undefined
 /**
  * 获取 compact boundary marker 的 Buffer。
- * 1. 第一次调用时创建 `"compact_boundary"` 的字节序列。
- * 2. 后续调用复用缓存，减少 resume 加载路径上的重复分配。
+ *
+ * 该方法为 transcript 扫描提供可复用的字节 marker，避免重复创建相同 Buffer。
  */
 function compactBoundaryMarker(): Buffer {
   return (_compactBoundaryMarker ??= Buffer.from('"compact_boundary"'))
@@ -554,9 +540,8 @@ function compactBoundaryMarker(): Buffer {
 
 /**
  * 校验包含 marker 的行是否真的是 compact_boundary 系统行。
- * 1. marker 也可能出现在用户内容里，因此必须解析整行 JSON 确认 type/subtype。
- * 2. 命中 boundary 后读取 compactMetadata.preservedSegment，判断是否已经保留旧片段。
- * 3. 解析失败或类型不匹配时返回 null，表示这不是有效 boundary。
+ *
+ * 该方法用于区分真实 compact boundary 和普通消息文本中的同名字符串。
  */
 function parseBoundaryLine(
   line: string,
@@ -598,9 +583,8 @@ type Sink = {
 
 /**
  * 向输出缓冲区写入一段字节。
- * 1. 空范围直接返回。
- * 2. 当前 buffer 不够时按 2 倍增长，但不超过 cap。
- * 3. 将 src[start,end) 复制到输出末尾，并更新 len。
+ *
+ * 该方法封装可增长输出缓冲区，供 transcript 分块加载过程复用。
  */
 function sinkWrite(s: Sink, src: Buffer, start: number, end: number): void {
   const n = end - start
@@ -620,8 +604,8 @@ function sinkWrite(s: Sink, src: Buffer, start: number, end: number): void {
 
 /**
  * 判断 src 的指定范围是否以 prefix 开头。
- * 1. 先检查剩余长度是否足够。
- * 2. 再用 Buffer.compare 做字节级比较，避免把二进制片段转成字符串。
+ *
+ * 该方法用于在 transcript 扫描中快速识别特殊 JSONL 行前缀。
  */
 function hasPrefix(
   src: Buffer,
@@ -676,11 +660,8 @@ type LoadState = {
 
 /**
  * 处理跨 chunk 边界的半行。
- * 1. 如果上一个 chunk 没有 carry，直接返回 0，让调用方从 chunk 开头扫描。
- * 2. 如果当前 chunk 还没有补齐换行，返回 0，等待后续拼接处理。
- * 3. 如果跨边界行是 attribution snapshot，只记录最后 snapshot，不写入输出。
- * 4. 如果跨边界行是 compact boundary，根据 preservedSegment 决定是否截断输出。
- * 5. 普通跨边界行写回输出，并返回当前 chunk 已消费的偏移。
+ *
+ * 该方法用于保证分块读取时跨边界 JSONL 行仍按完整行语义处理。
  */
 function processStraddle(
   s: LoadState,
@@ -731,10 +712,8 @@ function processStraddle(
 
 /**
  * 扫描一个完整 buffer 中的 JSONL 行。
- * 1. 按 LF 找行，未结束的尾部不处理，交给 captureCarry 保存到下一轮。
- * 2. attribution snapshot 行不写入输出，只记录最后一次出现的位置。
- * 3. compact boundary 行会根据 preservedSegment 决定保留还是清空已有输出。
- * 4. 普通行按连续 run 批量写入，减少 sinkWrite 调用次数。
+ *
+ * 该方法用于过滤 transcript 中的特殊行，并保留最终需要加载的消息内容。
  */
 function scanChunkLines(
   s: LoadState,
@@ -797,9 +776,8 @@ function scanChunkLines(
 
 /**
  * 捕获当前扫描过程中发现的最后一条 attribution snapshot。
- * 1. 当前 buffer 内找到 snapshot 时，它一定晚于跨 chunk snapshot，优先使用当前 buffer 的版本。
- * 2. 如果只发现跨 chunk snapshot，则把 carry 前半段和当前 chunk 后半段拼成完整 snapshot。
- * 3. 复制到 lastSnapBuf，避免复用的 chunk buffer 被下一轮读取覆盖。
+ *
+ * 该方法用于把 attribution snapshot 延后到 transcript 输出末尾统一追加。
  */
 function captureSnap(
   s: LoadState,
@@ -830,8 +808,8 @@ function captureSnap(
 
 /**
  * 保存当前 buffer 末尾未遇到 LF 的半行。
- * 1. 计算 trailStart 之后还剩多少字节。
- * 2. 有剩余时复制到 carryBuf，下一轮与新 chunk 的开头拼接处理。
+ *
+ * 该方法用于把未闭合 JSONL 行留到下一轮读取后继续处理。
  */
 function captureCarry(s: LoadState, buf: Buffer, trailStart: number): void {
   s.carryLen = buf.length - trailStart
@@ -846,9 +824,8 @@ function captureCarry(s: LoadState, buf: Buffer, trailStart: number): void {
 
 /**
  * 完成 transcript 输出收尾。
- * 1. 文件末尾仍有 carry 时，判断它是 attribution snapshot 还是普通半行。
- * 2. 普通半行写入输出；snapshot 则作为最后 snapshot 保存。
- * 3. 如果存在最后 snapshot，确保前面有 LF，再追加到输出末尾。
+ *
+ * 该方法用于处理文件末尾残留内容，并确保最后的 attribution snapshot 出现在输出末尾。
  */
 function finalizeOutput(s: LoadState): void {
   if (s.carryLen > 0) {
@@ -873,11 +850,8 @@ function finalizeOutput(s: LoadState): void {
 
 /**
  * 为 session resume/load 读取 transcript 文件。
- * 1. 使用固定 1MB chunk 顺序读取，避免一次性加载大 JSONL 文件。
- * 2. 处理跨 chunk 半行，保证 JSONL 行边界判断正确。
- * 3. 扫描完整行，剥离 attribution snapshot，并在 compact boundary 处截断旧内容。
- * 4. 保存尾部半行和最后一条 snapshot，循环结束后统一收尾。
- * 5. 返回 compact 后的 Buffer、boundary 原始偏移和 preservedSegment 标记。
+ *
+ * 该方法用于 resume/load 时读取可继续恢复的 transcript 内容，并返回 compact 相关元信息。
  */
 export async function readTranscriptForLoad(
   filePath: string,

@@ -30,9 +30,8 @@ let pendingInitialUserMessage: string | undefined
 
 /**
  * 取出 SessionStart Hook 产生的初始用户消息。
- * 1. 读取上一次 Hook 暂存的 pendingInitialUserMessage。
- * 2. 立即清空缓存，保证该消息只会被消费一次。
- * 3. 返回消息内容；如果没有 Hook 写入则返回 undefined。
+ *
+ * 该消息用于把 Hook 生成的首条用户输入交给后续启动流程消费，并保持一次性消费语义。
  */
 export function takeInitialUserMessage(): string | undefined {
   // 1. 先把暂存值复制到局部变量，后续清空不会影响本次返回。
@@ -45,12 +44,9 @@ export function takeInitialUserMessage(): string | undefined {
 // 启动路径必须保持轻量：不要在这里加入任何 warmup 逻辑或额外启动工作。
 /**
  * 执行 SessionStart Hook，并把 Hook 的结果整理成可追加到会话中的消息。
- * 1. bare 模式直接跳过所有 Hook，避免无意义的插件加载。
- * 2. 准备消息、附加上下文和文件监听路径三个收集器。
- * 3. 按策略加载插件 Hook；受管 Hook-only 策略下禁止加载不受信任插件。
- * 4. 调用 executeSessionStartHooks 逐条消费 Hook 结果。
- * 5. 收集 Hook 消息、附加上下文、初始用户消息和 watchPaths。
- * 6. 更新文件监听路径，并把附加上下文包装成 hook_additional_context 消息。
+ *
+ * 该方法统一处理启动、恢复、清空和 compact 后的 SessionStart 扩展点，
+ * 让 Hook 能为当前会话补充上下文、初始输入和文件监听路径。
  */
 export async function processSessionStartHooks(
   source: 'startup' | 'resume' | 'clear' | 'compact',
@@ -198,10 +194,8 @@ export async function processSessionStartHooks(
 
 /**
  * 执行 Setup Hook，并把 Hook 输出整理成可注入会话的消息。
- * 1. bare 模式直接跳过，避免加载和执行任何 Hook。
- * 2. 按策略加载插件 Hook；加载失败只记录警告，不中断 setup 流程。
- * 3. 逐条消费 executeSetupHooks 的结果，收集消息和附加上下文。
- * 4. 将附加上下文包装成 hook_additional_context 消息后返回。
+ *
+ * 该方法用于 CLI 初始化和维护流程，为会话准备外部 Hook 提供的初始上下文。
  */
 export async function processSetupHooks(
   trigger: 'init' | 'maintenance',
