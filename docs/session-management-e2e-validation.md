@@ -5,12 +5,13 @@
 - `src/utils/sessionStart.ts`
 - `src/utils/sessionStoragePortable.ts`
 
-验证目标：
+验证重点：
 
-1. 验证 `Setup`、`SessionStart` Hook 的启动、恢复、清空会话触发链路。
+1. 验证 `Setup`、`SessionStart` Hook 在启动、恢复、清空会话时的触发链路。
 2. 验证 `--bare` 模式会跳过 Hook 加载和执行。
 3. 验证 session 文件定位、轻量读取、首条用户提示词提取。
-4. 验证大 transcript 读取时 compact boundary 截断、preservedSegment 保留、attribution snapshot 处理。
+4. 验证大 transcript 读取时 compact boundary 截断、`preservedSegment` 保留、`attribution-snapshot` 收尾处理。
+5. 验证整个端到端测试过程写入固定目录，而不是写入仓库下的 `.claude` 目录。
 
 ## 1. 公共前置条件
 
@@ -24,7 +25,33 @@
   - 已设置 `ANTHROPIC_API_KEY`
   - 或已通过 `.\cli-dev.exe /login` 登录
 
-### 1.2 初始化验证环境
+### 1.2 固定测试目录约定
+
+所有测试文件统一写入 `D:\tmp\free-code-e2e`，避免污染仓库下的 `.claude` 目录，也避免污染真实用户的 session 目录。
+
+固定目录结构：
+
+```text
+D:\tmp\free-code-e2e
+├── claude-config
+│   └── projects
+├── data
+├── hooks
+├── logs
+└── settings.json
+```
+
+目录用途：
+
+- `claude-config`：通过 `CLAUDE_CONFIG_DIR` 指定给 CLI，用于隔离 session 存储。
+- `hooks`：存放端到端验证用 Hook 脚本。
+- `logs`：存放 Hook 输入、debug log、人工检查日志。
+- `data`：存放手工构造的大 transcript 文件。
+- `settings.json`：通过 `--settings` 显式传给 CLI，避免写入 `.claude/settings.json`。
+
+### 1.3 初始化验证环境
+
+输入：
 
 ```powershell
 cd D:\Code\free-code
@@ -32,120 +59,137 @@ cd D:\Code\free-code
 bun install
 bun run build:dev
 
-$env:CLAUDE_CONFIG_DIR = "$env:TEMP\free-code-e2e-claude"
-Remove-Item -Recurse -Force $env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force $env:CLAUDE_CONFIG_DIR | Out-Null
-New-Item -ItemType Directory -Force .claude\hooks | Out-Null
+$env:FREE_CODE_E2E_ROOT = "D:\tmp\free-code-e2e"
+$env:CLAUDE_CONFIG_DIR = Join-Path $env:FREE_CODE_E2E_ROOT "claude-config"
+
+Remove-Item -Recurse -Force $env:FREE_CODE_E2E_ROOT -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force $env:FREE_CODE_E2E_ROOT | Out-Null
+New-Item -ItemType Directory -Force (Join-Path $env:FREE_CODE_E2E_ROOT "claude-config") | Out-Null
+New-Item -ItemType Directory -Force (Join-Path $env:FREE_CODE_E2E_ROOT "hooks") | Out-Null
+New-Item -ItemType Directory -Force (Join-Path $env:FREE_CODE_E2E_ROOT "logs") | Out-Null
+New-Item -ItemType Directory -Force (Join-Path $env:FREE_CODE_E2E_ROOT "data") | Out-Null
 ```
 
 期望输出：
 
 - `bun install` 成功。
 - `bun run build:dev` 成功，并生成 `.\cli-dev.exe`。
-- `$env:CLAUDE_CONFIG_DIR` 指向隔离目录，避免污染真实用户 session。
+- `$env:FREE_CODE_E2E_ROOT` 指向固定测试根目录。
+- `$env:CLAUDE_CONFIG_DIR` 指向 `D:\tmp\free-code-e2e\claude-config`。
+- 仓库根目录不会新增 `.claude` 测试文件。
 
 ## 2. 用例 1：Setup 和 SessionStart startup Hook 正常执行
 
 ### 验证目标
 
-验证 `processSetupHooks('init')` 和 `processSessionStartHooks('startup')` 能通过 CLI 启动路径被端到端触发。
+验证 `processSetupHooks("init")` 和 `processSessionStartHooks("startup")` 能通过 CLI 启动链路被端到端触发。
 
 ### 输入
 
-- `.claude/settings.json`
-- `.claude/hooks/setup.ps1`
-- `.claude/hooks/session-start.ps1`
+- `$env:FREE_CODE_E2E_ROOT\hooks\setup.ps1`
+- `$env:FREE_CODE_E2E_ROOT\hooks\session-start.ps1`
+- `$env:FREE_CODE_E2E_ROOT\settings.json`
 
 ### 操作步骤
 
 1. 创建 `Setup` Hook 脚本。
 
 ```powershell
+$setupHook = Join-Path $env:FREE_CODE_E2E_ROOT "hooks\setup.ps1"
+
 @'
 $inputJson = [Console]::In.ReadToEnd()
-$inputJson | Set-Content -Encoding UTF8 ".\.claude\hook-setup-input.json"
+$outputFile = Join-Path $env:FREE_CODE_E2E_ROOT "logs\hook-setup-input.json"
+$inputJson | Set-Content -Encoding UTF8 $outputFile
 Write-Output '{"hookSpecificOutput":{"hookEventName":"Setup","additionalContext":"E2E_SETUP_CONTEXT"}}'
-'@ | Set-Content -Encoding UTF8 .\.claude\hooks\setup.ps1
+'@ | Set-Content -Encoding UTF8 $setupHook
 ```
 
 2. 创建 `SessionStart` Hook 脚本。
 
 ```powershell
+$sessionStartHook = Join-Path $env:FREE_CODE_E2E_ROOT "hooks\session-start.ps1"
+
 @'
 $inputJson = [Console]::In.ReadToEnd()
-$inputJson | Set-Content -Encoding UTF8 ".\.claude\hook-sessionstart-input.json"
+$outputFile = Join-Path $env:FREE_CODE_E2E_ROOT "logs\hook-sessionstart-input.json"
+$inputJson | Set-Content -Encoding UTF8 $outputFile
 Write-Output '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"E2E_SESSION_CONTEXT","initialUserMessage":"E2E_INITIAL_PROMPT","watchPaths":[]}}'
-'@ | Set-Content -Encoding UTF8 .\.claude\hooks\session-start.ps1
+'@ | Set-Content -Encoding UTF8 $sessionStartHook
 ```
 
-3. 创建 `.claude/settings.json`。
+3. 创建独立 `settings.json`。
 
 ```powershell
-@'
-{
-  "hooks": {
-    "Setup": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "shell": "powershell",
-            "command": ".\\.claude\\hooks\\setup.ps1"
+$settingsFile = Join-Path $env:FREE_CODE_E2E_ROOT "settings.json"
+
+$settings = @{
+  hooks = @{
+    Setup = @(
+      @{
+        hooks = @(
+          @{
+            type = "command"
+            shell = "powershell"
+            command = $setupHook
           }
-        ]
+        )
       }
-    ],
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "shell": "powershell",
-            "command": ".\\.claude\\hooks\\session-start.ps1"
+    )
+    SessionStart = @(
+      @{
+        hooks = @(
+          @{
+            type = "command"
+            shell = "powershell"
+            command = $sessionStartHook
           }
-        ]
+        )
       }
-    ]
+    )
   }
 }
-'@ | Set-Content -Encoding UTF8 .\.claude\settings.json
+
+$settings | ConvertTo-Json -Depth 10 | Set-Content -Encoding UTF8 $settingsFile
 ```
 
-4. 执行 `init-only` 启动路径。
+4. 执行 `init-only` 启动链路。
 
 ```powershell
-.\cli-dev.exe --init-only --debug hooks --debug-file .\.claude\e2e-hooks.log
+$debugLog = Join-Path $env:FREE_CODE_E2E_ROOT "logs\e2e-hooks.log"
+
+.\cli-dev.exe --settings $settingsFile --init-only --debug hooks --debug-file $debugLog
 ```
 
-5. 检查 Hook 输入文件。
+5. 检查 Hook 输入文件和 debug log。
 
 ```powershell
-Get-Content .\.claude\hook-setup-input.json
-Get-Content .\.claude\hook-sessionstart-input.json
-Get-Content .\.claude\e2e-hooks.log
+Get-Content (Join-Path $env:FREE_CODE_E2E_ROOT "logs\hook-setup-input.json")
+Get-Content (Join-Path $env:FREE_CODE_E2E_ROOT "logs\hook-sessionstart-input.json")
+Get-Content (Join-Path $env:FREE_CODE_E2E_ROOT "logs\e2e-hooks.log")
 ```
 
 ### 期望输出
 
 - CLI 进程退出码为 `0`。
-- `.claude\hook-setup-input.json` 存在。
-- `.claude\hook-setup-input.json` 包含：
+- `D:\tmp\free-code-e2e\logs\hook-setup-input.json` 存在。
+- `hook-setup-input.json` 包含：
 
 ```json
 "hook_event_name":"Setup"
 ```
 
-- `.claude\hook-sessionstart-input.json` 存在。
-- `.claude\hook-sessionstart-input.json` 包含：
+- `D:\tmp\free-code-e2e\logs\hook-sessionstart-input.json` 存在。
+- `hook-sessionstart-input.json` 包含：
 
 ```json
 "hook_event_name":"SessionStart"
 ```
 
 - debug log 中能看到 Hook 加载或执行相关日志。
-- 说明 `processSetupHooks()` 和 `processSessionStartHooks('startup')` 都已被触发。
+- 仓库根目录不应出现 `.claude\hook-setup-input.json`、`.claude\hook-sessionstart-input.json` 或 `.claude\e2e-hooks.log`。
 
-## 3. 用例 2：--bare 模式跳过所有 Hook
+## 3. 用例 2：bare 模式跳过所有 Hook
 
 ### 验证目标
 
@@ -153,28 +197,31 @@ Get-Content .\.claude\e2e-hooks.log
 
 ### 输入
 
-沿用用例 1 的 `.claude/settings.json` 和 Hook 脚本。
+沿用用例 1 创建的固定测试目录、独立 `settings.json` 和 Hook 脚本。
 
 ### 操作步骤
 
 1. 删除上一次 Hook 输出。
 
 ```powershell
-Remove-Item .\.claude\hook-setup-input.json -ErrorAction SilentlyContinue
-Remove-Item .\.claude\hook-sessionstart-input.json -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $env:FREE_CODE_E2E_ROOT "logs\hook-setup-input.json") -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $env:FREE_CODE_E2E_ROOT "logs\hook-sessionstart-input.json") -ErrorAction SilentlyContinue
 ```
 
 2. 以 `--bare` 模式启动。
 
 ```powershell
-.\cli-dev.exe --bare --init-only --debug hooks --debug-file .\.claude\e2e-bare.log
+$settingsFile = Join-Path $env:FREE_CODE_E2E_ROOT "settings.json"
+$debugLog = Join-Path $env:FREE_CODE_E2E_ROOT "logs\e2e-bare.log"
+
+.\cli-dev.exe --settings $settingsFile --bare --init-only --debug hooks --debug-file $debugLog
 ```
 
 3. 检查 Hook 输出文件。
 
 ```powershell
-Test-Path .\.claude\hook-setup-input.json
-Test-Path .\.claude\hook-sessionstart-input.json
+Test-Path (Join-Path $env:FREE_CODE_E2E_ROOT "logs\hook-setup-input.json")
+Test-Path (Join-Path $env:FREE_CODE_E2E_ROOT "logs\hook-sessionstart-input.json")
 ```
 
 ### 期望输出
@@ -188,7 +235,7 @@ False
 
 - `Setup` Hook 没有执行。
 - `SessionStart` Hook 没有执行。
-- `processSetupHooks()` 和 `processSessionStartHooks()` 在 bare 模式下直接返回空数组。
+- `processSetupHooks()` 和 `processSessionStartHooks()` 在 bare 模式下直接返回空结果。
 
 ## 4. 用例 3：创建 session 文件并验证轻量读取
 
@@ -248,12 +295,13 @@ bun -e "import { resolveSessionFilePath, readSessionLite, extractFirstPromptFrom
 - `resolveSessionFilePath()` 能根据当前目录定位到 session 文件。
 - `readSessionLite()` 能读取文件头尾内容。
 - `extractFirstPromptFromHead()` 能提取第一条真实用户输入。
+- session 文件实际位于 `D:\tmp\free-code-e2e\claude-config\projects` 下，而不是仓库 `.claude` 下。
 
 ## 5. 用例 4：无 dir 参数时扫描所有 project session
 
 ### 验证目标
 
-验证 `resolveSessionFilePath(sessionId)` 未传 `dir` 时，可以扫描 `$CLAUDE_CONFIG_DIR\projects` 下所有项目目录。
+验证 `resolveSessionFilePath(sessionId)` 未传 `dir` 时，可以扫描 `$env:CLAUDE_CONFIG_DIR\projects` 下所有项目目录。
 
 ### 输入
 
@@ -275,13 +323,13 @@ bun -e "import { resolveSessionFilePath } from './src/utils/sessionStoragePortab
 
 - `found` 必须为 `true`。
 - `projectPath` 应为 `undefined` 或不出现在 JSON 中。
-- 说明没有目录上下文时，全局扫描逻辑可用。
+- 没有目录上下文时，全局扫描逻辑可用。
 
 ## 6. 用例 5：首条 prompt 提取跳过 meta、compact summary 和 slash command
 
 ### 验证目标
 
-验证 `extractFirstPromptFromHead()` 会跳过非真实用户输入，并保留 slash command 作为兜底。
+验证 `extractFirstPromptFromHead()` 会跳过非真实用户输入，并在存在自然语言输入时优先返回自然语言输入。
 
 ### 输入
 
@@ -358,7 +406,7 @@ bun -e "import { extractFirstPromptFromHead } from './src/utils/sessionStoragePo
 
 - 删除 boundary 前旧内容。
 - 保留 boundary 后内容。
-- 只保留最后一条 attribution snapshot。
+- 只保留最后一条 `attribution-snapshot`。
 - 返回有效 `boundaryStartOffset`。
 
 ### 输入
@@ -368,7 +416,7 @@ bun -e "import { extractFirstPromptFromHead } from './src/utils/sessionStoragePo
 ### 操作步骤
 
 ```powershell
-$largeFile = "$env:TEMP\free-code-e2e-large.jsonl"
+$largeFile = Join-Path $env:FREE_CODE_E2E_ROOT "data\free-code-e2e-large.jsonl"
 $pad = "x" * (6 * 1024 * 1024)
 
 @(
@@ -379,7 +427,7 @@ $pad = "x" * (6 * 1024 * 1024)
   '{"type":"attribution-snapshot","snapshot":{"id":"last"}}'
 ) | Set-Content -Encoding UTF8 $largeFile
 
-bun -e "import { readTranscriptForLoad } from './src/utils/sessionStoragePortable.ts'; import { stat } from 'fs/promises'; const file=process.env.TEMP+'\\\\free-code-e2e-large.jsonl'; const s=await stat(file); const r=await readTranscriptForLoad(file,s.size); const text=r.postBoundaryBuf.toString('utf8'); console.log(JSON.stringify({hasBefore:text.includes('BEFORE_BOUNDARY'), hasAfter:text.includes('AFTER_BOUNDARY'), hasSnapshot:text.includes('attribution-snapshot'), boundary:r.boundaryStartOffset>0, preserved:r.hasPreservedSegment}))"
+bun -e "import { readTranscriptForLoad } from './src/utils/sessionStoragePortable.ts'; import { stat } from 'fs/promises'; const file=process.env.FREE_CODE_E2E_ROOT+'\\\\data\\\\free-code-e2e-large.jsonl'; const s=await stat(file); const r=await readTranscriptForLoad(file,s.size); const text=r.postBoundaryBuf.toString('utf8'); console.log(JSON.stringify({hasBefore:text.includes('BEFORE_BOUNDARY'), hasAfter:text.includes('AFTER_BOUNDARY'), hasSnapshot:text.includes('attribution-snapshot'), boundary:r.boundaryStartOffset>0, preserved:r.hasPreservedSegment}))"
 ```
 
 ### 期望输出
@@ -392,7 +440,7 @@ bun -e "import { readTranscriptForLoad } from './src/utils/sessionStoragePortabl
 
 - `BEFORE_BOUNDARY` 被截断。
 - `AFTER_BOUNDARY` 被保留。
-- attribution snapshot 被保留到输出末尾。
+- `attribution-snapshot` 被保留到输出末尾。
 - `boundaryStartOffset > 0`。
 - `hasPreservedSegment` 为 `false`。
 
@@ -404,12 +452,12 @@ bun -e "import { readTranscriptForLoad } from './src/utils/sessionStoragePortabl
 
 ### 输入
 
-一个包含 preservedSegment compact boundary 的 JSONL 文件。
+一个包含 `preservedSegment` compact boundary 的 JSONL 文件。
 
 ### 操作步骤
 
 ```powershell
-$preservedFile = "$env:TEMP\free-code-e2e-preserved.jsonl"
+$preservedFile = Join-Path $env:FREE_CODE_E2E_ROOT "data\free-code-e2e-preserved.jsonl"
 
 @(
   '{"type":"user","message":{"content":"BEFORE_PRESERVED"}}',
@@ -417,7 +465,7 @@ $preservedFile = "$env:TEMP\free-code-e2e-preserved.jsonl"
   '{"type":"user","message":{"content":"AFTER_PRESERVED"}}'
 ) | Set-Content -Encoding UTF8 $preservedFile
 
-bun -e "import { readTranscriptForLoad } from './src/utils/sessionStoragePortable.ts'; import { stat } from 'fs/promises'; const file=process.env.TEMP+'\\\\free-code-e2e-preserved.jsonl'; const s=await stat(file); const r=await readTranscriptForLoad(file,s.size); const text=r.postBoundaryBuf.toString('utf8'); console.log(JSON.stringify({hasBefore:text.includes('BEFORE_PRESERVED'), hasAfter:text.includes('AFTER_PRESERVED'), preserved:r.hasPreservedSegment}))"
+bun -e "import { readTranscriptForLoad } from './src/utils/sessionStoragePortable.ts'; import { stat } from 'fs/promises'; const file=process.env.FREE_CODE_E2E_ROOT+'\\\\data\\\\free-code-e2e-preserved.jsonl'; const s=await stat(file); const r=await readTranscriptForLoad(file,s.size); const text=r.postBoundaryBuf.toString('utf8'); console.log(JSON.stringify({hasBefore:text.includes('BEFORE_PRESERVED'), hasAfter:text.includes('AFTER_PRESERVED'), preserved:r.hasPreservedSegment}))"
 ```
 
 ### 期望输出
@@ -445,7 +493,7 @@ bun -e "import { readTranscriptForLoad } from './src/utils/sessionStoragePortabl
 ### 操作步骤
 
 ```powershell
-$snapFile = "$env:TEMP\free-code-e2e-snapshot-tail.jsonl"
+$snapFile = Join-Path $env:FREE_CODE_E2E_ROOT "data\free-code-e2e-snapshot-tail.jsonl"
 $pad = "x" * (1024 * 1024 + 128)
 
 @(
@@ -454,7 +502,7 @@ $pad = "x" * (1024 * 1024 + 128)
   '{"type":"attribution-snapshot","snapshot":{"id":"tail-snapshot"}}'
 ) | Set-Content -Encoding UTF8 $snapFile
 
-bun -e "import { readTranscriptForLoad } from './src/utils/sessionStoragePortable.ts'; import { stat } from 'fs/promises'; const file=process.env.TEMP+'\\\\free-code-e2e-snapshot-tail.jsonl'; const s=await stat(file); const r=await readTranscriptForLoad(file,s.size); const text=r.postBoundaryBuf.toString('utf8'); console.log(JSON.stringify({hasUser:text.includes('TAIL_USER_MESSAGE'), snapCount:(text.match(/attribution-snapshot/g)||[]).length, endsWithSnapshot:text.trimEnd().endsWith('}}')}))"
+bun -e "import { readTranscriptForLoad } from './src/utils/sessionStoragePortable.ts'; import { stat } from 'fs/promises'; const file=process.env.FREE_CODE_E2E_ROOT+'\\\\data\\\\free-code-e2e-snapshot-tail.jsonl'; const s=await stat(file); const r=await readTranscriptForLoad(file,s.size); const text=r.postBoundaryBuf.toString('utf8'); console.log(JSON.stringify({hasUser:text.includes('TAIL_USER_MESSAGE'), snapCount:(text.match(/attribution-snapshot/g)||[]).length, endsWithSnapshot:text.trimEnd().endsWith('}}')}))"
 ```
 
 ### 期望输出
@@ -466,14 +514,14 @@ bun -e "import { readTranscriptForLoad } from './src/utils/sessionStoragePortabl
 说明：
 
 - 用户消息被保留。
-- attribution snapshot 只出现一次。
+- `attribution-snapshot` 只出现一次。
 - snapshot 位于输出末尾。
 
-## 12. 用例 11：/resume 触发 SessionStart Hook
+## 12. 用例 11：resume 触发 SessionStart Hook
 
 ### 验证目标
 
-验证交互式 `/resume` 会触发 `processSessionStartHooks('resume')`。
+验证交互式 `/resume` 会触发 `processSessionStartHooks("resume")`。
 
 ### 输入
 
@@ -484,13 +532,15 @@ bun -e "import { readTranscriptForLoad } from './src/utils/sessionStoragePortabl
 1. 删除旧 Hook 输出。
 
 ```powershell
-Remove-Item .\.claude\hook-sessionstart-input.json -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $env:FREE_CODE_E2E_ROOT "logs\hook-sessionstart-input.json") -ErrorAction SilentlyContinue
 ```
 
 2. 启动 CLI。
 
 ```powershell
-.\cli-dev.exe
+$settingsFile = Join-Path $env:FREE_CODE_E2E_ROOT "settings.json"
+
+.\cli-dev.exe --settings $settingsFile
 ```
 
 3. 在交互界面输入：
@@ -502,12 +552,12 @@ Remove-Item .\.claude\hook-sessionstart-input.json -ErrorAction SilentlyContinue
 4. 退出 CLI 后检查 Hook 输入。
 
 ```powershell
-Get-Content .\.claude\hook-sessionstart-input.json
+Get-Content (Join-Path $env:FREE_CODE_E2E_ROOT "logs\hook-sessionstart-input.json")
 ```
 
 ### 期望输出
 
-- `.claude\hook-sessionstart-input.json` 存在。
+- `D:\tmp\free-code-e2e\logs\hook-sessionstart-input.json` 存在。
 - 内容包含：
 
 ```json
@@ -515,13 +565,13 @@ Get-Content .\.claude\hook-sessionstart-input.json
 ```
 
 - 输入 JSON 中应体现 resume 触发来源。
-- 说明 `REPL.tsx -> processSessionStartHooks('resume')` 链路可用。
+- 说明 `REPL.tsx -> processSessionStartHooks("resume")` 链路可用。
 
-## 13. 用例 12：/clear 后重新执行 SessionStart Hook
+## 13. 用例 12：clear 后重新执行 SessionStart Hook
 
 ### 验证目标
 
-验证交互式 `/clear` 会触发 `processSessionStartHooks('clear')`。
+验证交互式 `/clear` 会触发 `processSessionStartHooks("clear")`。
 
 ### 输入
 
@@ -532,13 +582,15 @@ Get-Content .\.claude\hook-sessionstart-input.json
 1. 删除旧 Hook 输出。
 
 ```powershell
-Remove-Item .\.claude\hook-sessionstart-input.json -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $env:FREE_CODE_E2E_ROOT "logs\hook-sessionstart-input.json") -ErrorAction SilentlyContinue
 ```
 
 2. 启动 CLI。
 
 ```powershell
-.\cli-dev.exe
+$settingsFile = Join-Path $env:FREE_CODE_E2E_ROOT "settings.json"
+
+.\cli-dev.exe --settings $settingsFile
 ```
 
 3. 在交互界面输入：
@@ -550,12 +602,12 @@ Remove-Item .\.claude\hook-sessionstart-input.json -ErrorAction SilentlyContinue
 4. 退出 CLI 后检查 Hook 输入。
 
 ```powershell
-Get-Content .\.claude\hook-sessionstart-input.json
+Get-Content (Join-Path $env:FREE_CODE_E2E_ROOT "logs\hook-sessionstart-input.json")
 ```
 
 ### 期望输出
 
-- `.claude\hook-sessionstart-input.json` 存在。
+- `D:\tmp\free-code-e2e\logs\hook-sessionstart-input.json` 存在。
 - 内容包含：
 
 ```json
@@ -563,7 +615,7 @@ Get-Content .\.claude\hook-sessionstart-input.json
 ```
 
 - 输入 JSON 中应体现 clear 触发来源。
-- 说明 `/clear -> processSessionStartHooks('clear')` 链路可用。
+- 说明 `/clear -> processSessionStartHooks("clear")` 链路可用。
 
 ## 14. 用例 13：非法 UUID 不进入 session 定位
 
@@ -592,7 +644,37 @@ bun -e "import { validateUuid } from './src/utils/sessionStoragePortable.ts'; co
 - 非法 UUID 不会被当成 sessionId。
 - 合法 UUID 会通过格式校验。
 
-## 15. 回归验证命令
+## 15. 路径隔离检查
+
+### 验证目标
+
+确认端到端验证不会把临时 Hook、debug log 或 settings 写入仓库 `.claude` 目录。
+
+### 操作步骤
+
+```powershell
+Test-Path .\.claude\settings.json
+Test-Path .\.claude\hook-setup-input.json
+Test-Path .\.claude\hook-sessionstart-input.json
+Test-Path .\.claude\e2e-hooks.log
+Test-Path .\.claude\e2e-bare.log
+
+Get-ChildItem -Recurse $env:FREE_CODE_E2E_ROOT | Select-Object FullName
+```
+
+### 期望输出
+
+- 如果仓库原本没有 `.claude/settings.json`，第一组 `Test-Path` 应全部输出 `False`。
+- 如果仓库已有业务配置文件，只要本次测试没有新增 `hook-*.json` 和 `e2e-*.log` 即可。
+- `Get-ChildItem` 应能看到：
+  - `D:\tmp\free-code-e2e\settings.json`
+  - `D:\tmp\free-code-e2e\hooks\setup.ps1`
+  - `D:\tmp\free-code-e2e\hooks\session-start.ps1`
+  - `D:\tmp\free-code-e2e\logs\hook-setup-input.json`
+  - `D:\tmp\free-code-e2e\logs\hook-sessionstart-input.json`
+  - `D:\tmp\free-code-e2e\claude-config\projects\...`
+
+## 16. 回归验证命令
 
 完成以上端到端验证后，执行以下回归命令：
 
@@ -606,17 +688,23 @@ bun run build
 - `sessionStorage.test.ts` 全部通过。
 - `bun run build` 成功生成 `.\cli` 或相关构建产物。
 
-## 16. 清理验证环境
+## 17. 清理验证环境
+
+输入：
 
 ```powershell
-Remove-Item -Recurse -Force $env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
-Remove-Item .\.claude\hook-setup-input.json -ErrorAction SilentlyContinue
-Remove-Item .\.claude\hook-sessionstart-input.json -ErrorAction SilentlyContinue
-Remove-Item .\.claude\e2e-hooks.log -ErrorAction SilentlyContinue
-Remove-Item .\.claude\e2e-bare.log -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force $env:FREE_CODE_E2E_ROOT -ErrorAction SilentlyContinue
 ```
 
-注意：
+期望输出：
 
-- 如果 `.claude/settings.json` 是临时创建的验证配置，验证完成后请按需要删除或恢复。
-- 本文档中的 session 文件全部写入 `$env:CLAUDE_CONFIG_DIR` 指向的隔离目录，不应影响真实用户历史会话。
+- `D:\tmp\free-code-e2e` 被删除。
+- 仓库下 `.claude` 目录没有本次端到端验证产生的临时文件。
+
+## 18. 关键结论
+
+- 固定测试根目录使用 `$env:FREE_CODE_E2E_ROOT` 控制。
+- session 存储目录使用 `$env:CLAUDE_CONFIG_DIR` 控制。
+- Hook 配置通过 `--settings $settingsFile` 控制。
+- Hook 脚本、Hook 输入、debug log、大 transcript 测试数据全部写入 `$env:FREE_CODE_E2E_ROOT`。
+- 不需要在仓库下创建 `.claude/settings.json`，也不需要把测试输出放进 `.claude`。
