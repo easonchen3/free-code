@@ -53,6 +53,13 @@ import {
   userFacingName,
 } from './UI.js'
 
+/**
+ * 文件写入工具定义。
+ *
+ * 这个文件负责声明写文件工具的输入输出结构、权限校验、并发防护、
+ * 实际写入流程以及结果展示映射。它会在写入前检查路径权限、文件
+ * 新鲜度和敏感内容，写入后同步诊断、编辑历史、diff 展示和外部编辑器通知。
+ */
 const inputSchema = lazySchema(() =>
   z.strictObject({
     file_path: z
@@ -96,42 +103,98 @@ export const FileWriteTool = buildTool({
   searchHint: 'create or overwrite files',
   maxResultSizeChars: 100_000,
   strict: true,
+  /**
+   * 返回工具能力的简要说明。
+   *
+   * @returns 面向模型和工具系统的能力描述。
+   */
   async description() {
     return 'Write a file to the local filesystem.'
   },
   userFacingName,
   getToolUseSummary,
+  /**
+   * 根据本次输入生成活动状态文案。
+   *
+   * @param input 工具调用输入，包含目标文件路径和写入内容。
+   * @returns 用于界面展示的当前活动描述。
+   */
   getActivityDescription(input) {
     const summary = getToolUseSummary(input)
     return summary ? `Writing ${summary}` : 'Writing file'
   },
+  /**
+   * 提供模型调用该工具时使用的提示说明。
+   *
+   * @returns 写文件工具的提示文本。
+   */
   async prompt() {
     return getWriteToolDescription()
   },
   renderToolUseMessage,
   isResultTruncated,
+  /**
+   * 提供工具输入结构。
+   *
+   * @returns 文件路径和文件内容的输入 schema。
+   */
   get inputSchema(): InputSchema {
     return inputSchema()
   },
+  /**
+   * 提供工具输出结构。
+   *
+   * @returns 写入结果、补丁和原始内容的输出 schema。
+   */
   get outputSchema(): OutputSchema {
     return outputSchema()
   },
+  /**
+   * 将输入转换为自动分类器可分析的文本。
+   *
+   * @param input 工具调用输入，包含文件路径和完整内容。
+   * @returns 拼接后的路径与内容文本。
+   */
   toAutoClassifierInput(input) {
     return `${input.file_path}: ${input.content}`
   },
+  /**
+   * 取得本次写入对应的文件路径。
+   *
+   * @param input 工具调用输入。
+   * @returns 输入中的文件路径。
+   */
   getPath(input): string {
     return input.file_path
   },
+  /**
+   * 规范化可观察输入中的文件路径。
+   *
+   * @param input 可能包含未展开路径的工具输入。
+   * @returns 无返回值，直接更新输入对象中的路径字段。
+   */
   backfillObservableInput(input) {
-    // hooks.mdx documents file_path as absolute; expand so hook allowlists
-    // can't be bypassed via ~ or relative paths.
+    // 1. 将 ~ 或相对路径展开为绝对路径，避免 hook allowlist 被路径写法绕过。
     if (typeof input.file_path === 'string') {
       input.file_path = expandPath(input.file_path)
     }
   },
+  /**
+   * 构建权限规则匹配函数。
+   *
+   * @param file_path 待写入的文件路径。
+   * @returns 用于判断规则是否匹配该路径的函数。
+   */
   async preparePermissionMatcher({ file_path }) {
     return pattern => matchWildcardPattern(pattern, file_path)
   },
+  /**
+   * 检查当前调用是否拥有写入权限。
+   *
+   * @param input 工具调用输入。
+   * @param context 工具运行上下文，提供应用权限状态。
+   * @returns 权限系统给出的允许、拒绝或需确认结果。
+   */
   async checkPermissions(input, context): Promise<PermissionDecision> {
     const appState = context.getAppState()
     return checkWritePermissionForTool(
@@ -143,23 +206,33 @@ export const FileWriteTool = buildTool({
   renderToolUseRejectedMessage,
   renderToolUseErrorMessage,
   renderToolResultMessage,
+  /**
+   * 提供可索引的搜索文本。
+   *
+   * @returns 空字符串，避免把未展示的完整内容加入搜索索引。
+   */
   extractSearchText() {
-    // Transcript render shows either content (create, via HighlightedCode)
-    // or a structured diff (update). The heuristic's 'content' allowlist key
-    // would index the raw content string even in update mode where it's NOT
-    // shown — phantom. Under-count: tool_use already indexes file_path.
+    // 1. 创建文件时界面展示内容，更新文件时界面展示结构化 diff；这里不额外索引原始内容，避免搜索命中用户看不到的文本。
+    // 2. 路径已经由 tool_use 索引覆盖，少记内容比记录幽灵内容更可控。
     return ''
   },
+  /**
+   * 校验写入输入是否满足安全和一致性要求。
+   *
+   * @param param0 文件路径和待写入内容。
+   * @param toolUseContext 工具运行上下文，提供权限状态和文件读取记录。
+   * @returns 校验结果；失败时包含面向调用方的错误信息和错误码。
+   */
   async validateInput({ file_path, content }, toolUseContext: ToolUseContext) {
     const fullFilePath = expandPath(file_path)
 
-    // Reject writes to team memory files that contain secrets
+    // 1. 阻止把疑似密钥内容写入团队记忆文件。
     const secretError = checkTeamMemSecrets(fullFilePath, content)
     if (secretError) {
       return { result: false, message: secretError, errorCode: 0 }
     }
 
-    // Check if path should be ignored based on permission settings
+    // 2. 按文件系统权限配置检查该路径是否被显式拒绝编辑。
     const appState = toolUseContext.getAppState()
     const denyRule = matchingRuleForInput(
       fullFilePath,
@@ -176,13 +249,12 @@ export const FileWriteTool = buildTool({
       }
     }
 
-    // SECURITY: Skip filesystem operations for UNC paths to prevent NTLM credential leaks.
-    // On Windows, fs.existsSync() on UNC paths triggers SMB authentication which could
-    // leak credentials to malicious servers. Let the permission check handle UNC paths.
+    // 3. Windows UNC 路径可能触发 SMB 认证，跳过本地 stat，交给权限层处理以避免凭据泄露。
     if (fullFilePath.startsWith('\\\\') || fullFilePath.startsWith('//')) {
       return { result: true }
     }
 
+    // 4. 读取当前文件状态；不存在的文件允许继续走创建流程。
     const fs = getFsImplementation()
     let fileMtimeMs: number
     try {
@@ -195,6 +267,7 @@ export const FileWriteTool = buildTool({
       throw e
     }
 
+    // 5. 已存在文件必须先完整读取，避免模型在不了解当前内容时覆盖用户改动。
     const readTimestamp = toolUseContext.readFileState.get(fullFilePath)
     if (!readTimestamp || readTimestamp.isPartialView) {
       return {
@@ -205,9 +278,7 @@ export const FileWriteTool = buildTool({
       }
     }
 
-    // Reuse mtime from the stat above — avoids a redundant statSync via
-    // getFileModificationTime. The readTimestamp guard above ensures this
-    // block is always reached when the file exists.
+    // 6. 复用前面的 mtime，确认文件没有在读取后被用户或格式化工具改过。
     const lastWriteTime = Math.floor(fileMtimeMs)
     if (lastWriteTime > readTimestamp.timestamp) {
       return {
@@ -220,6 +291,15 @@ export const FileWriteTool = buildTool({
 
     return { result: true }
   },
+  /**
+   * 执行文件创建或覆盖写入。
+   *
+   * @param param0 文件路径和待写入的完整内容。
+   * @param param1 工具运行状态，包含读取记录、文件历史状态和动态技能触发集合。
+   * @param _ 保留参数，当前实现不使用。
+   * @param parentMessage 触发本次工具调用的父消息，用于关联文件历史。
+   * @returns 写入结果数据，包含创建/更新类型、补丁信息和可选 git diff。
+   */
   async call(
     { file_path, content },
     { readFileState, updateFileHistoryState, dynamicSkillDirTriggers },
@@ -229,33 +309,27 @@ export const FileWriteTool = buildTool({
     const fullFilePath = expandPath(file_path)
     const dir = dirname(fullFilePath)
 
-    // Discover skills from this file's path (fire-and-forget, non-blocking)
+    // 1. 根据目标文件路径发现可能相关的技能目录，供后续上下文和附件展示使用。
     const cwd = getCwd()
     const newSkillDirs = await discoverSkillDirsForPaths([fullFilePath], cwd)
     if (newSkillDirs.length > 0) {
-      // Store discovered dirs for attachment display
+      // 2. 记录新发现的目录，让界面能展示本次写入触发了哪些动态技能。
       for (const dir of newSkillDirs) {
         dynamicSkillDirTriggers?.add(dir)
       }
-      // Don't await - let skill loading happen in the background
+      // 3. 技能加载不阻塞写文件主流程；失败也不影响文件写入。
       addSkillDirectories(newSkillDirs).catch(() => {})
     }
 
-    // Activate conditional skills whose path patterns match this file
+    // 4. 激活路径规则匹配的条件技能，让后续步骤能使用对应能力。
     activateConditionalSkillsForPaths([fullFilePath], cwd)
 
     await diagnosticTracker.beforeFileEdited(fullFilePath)
 
-    // Ensure parent directory exists before the atomic read-modify-write section.
-    // Must stay OUTSIDE the critical section below (a yield between the staleness
-    // check and writeTextContent lets concurrent edits interleave), and BEFORE the
-    // write (lazy-mkdir-on-ENOENT would fire a spurious tengu_atomic_write_error
-    // inside writeFileSyncAndFlush_DEPRECATED before ENOENT propagates back).
+    // 5. 在关键读写区间之前创建父目录，避免在新鲜度检查和实际写盘之间插入异步等待。
     await getFsImplementation().mkdir(dir)
     if (fileHistoryEnabled()) {
-      // Backup captures pre-edit content — safe to call before the staleness
-      // check (idempotent v1 backup keyed on content hash; if staleness fails
-      // later we just have an unused backup, not corrupt state).
+      // 6. 写入前保存历史快照；如果后续新鲜度检查失败，只会留下未使用备份，不会破坏状态。
       await fileHistoryTrackEdit(
         updateFileHistoryState,
         fullFilePath,
@@ -263,8 +337,7 @@ export const FileWriteTool = buildTool({
       )
     }
 
-    // Load current state and confirm no changes since last read.
-    // Please avoid async operations between here and writing to disk to preserve atomicity.
+    // 7. 进入同步读写段，重新读取当前内容并确认它仍然是模型之前看过的版本。
     let meta: ReturnType<typeof readFileSyncWithMetadata> | null
     try {
       meta = readFileSyncWithMetadata(fullFilePath)
@@ -280,14 +353,12 @@ export const FileWriteTool = buildTool({
       const lastWriteTime = getFileModificationTime(fullFilePath)
       const lastRead = readFileState.get(fullFilePath)
       if (!lastRead || lastWriteTime > lastRead.timestamp) {
-        // Timestamp indicates modification, but on Windows timestamps can change
-        // without content changes (cloud sync, antivirus, etc.). For full reads,
-        // compare content as a fallback to avoid false positives.
+        // 8. 时间戳显示文件更新时，再用完整内容兜底比较，减少云同步或杀毒软件造成的误报。
         const isFullRead =
           lastRead &&
           lastRead.offset === undefined &&
           lastRead.limit === undefined
-        // meta.content is CRLF-normalized — matches readFileState's normalized form.
+        // 9. meta.content 已按读取状态的规则做过换行归一化，因此可以直接比较。
         if (!isFullRead || meta.content !== lastRead.content) {
           throw new Error(FILE_UNEXPECTEDLY_MODIFIED_ERROR)
         }
@@ -297,26 +368,22 @@ export const FileWriteTool = buildTool({
     const enc = meta?.encoding ?? 'utf8'
     const oldContent = meta?.content ?? null
 
-    // Write is a full content replacement — the model sent explicit line endings
-    // in `content` and meant them. Do not rewrite them. Previously we preserved
-    // the old file's line endings (or sampled the repo via ripgrep for new
-    // files), which silently corrupted e.g. bash scripts with \r on Linux when
-    // overwriting a CRLF file or when binaries in cwd poisoned the repo sample.
+    // 10. 按模型给出的完整内容直接覆盖写入，保留 content 中明确携带的换行形式。
     writeTextContent(fullFilePath, content, enc, 'LF')
 
-    // Notify LSP servers about file modification (didChange) and save (didSave)
+    // 11. 通知 LSP 文件已修改并保存，让诊断和语言服务状态跟随最新内容。
     const lspManager = getLspServerManager()
     if (lspManager) {
-      // Clear previously delivered diagnostics so new ones will be shown
+      // 12. 清空旧诊断的已投递记录，避免新诊断被当成重复内容过滤。
       clearDeliveredDiagnosticsForFile(`file://${fullFilePath}`)
-      // didChange: Content has been modified
+      // 13. 发送 didChange，告诉语言服务内存中的文件内容已变化。
       lspManager.changeFile(fullFilePath, content).catch((err: Error) => {
         logForDebugging(
           `LSP: Failed to notify server of file change for ${fullFilePath}: ${err.message}`,
         )
         logError(err)
       })
-      // didSave: File has been saved to disk (triggers diagnostics in TypeScript server)
+      // 14. 发送 didSave，触发依赖保存事件的诊断刷新。
       lspManager.saveFile(fullFilePath).catch((err: Error) => {
         logForDebugging(
           `LSP: Failed to notify server of file save for ${fullFilePath}: ${err.message}`,
@@ -325,10 +392,10 @@ export const FileWriteTool = buildTool({
       })
     }
 
-    // Notify VSCode about the file change for diff view
+    // 15. 通知 VS Code 侧文件变化，便于差异视图展示新旧内容。
     notifyVscodeFileUpdated(fullFilePath, oldContent, content)
 
-    // Update read timestamp, to invalidate stale writes
+    // 16. 更新读取状态中的内容和时间戳，后续写入可据此判断是否过期。
     readFileState.set(fullFilePath, {
       content,
       timestamp: getFileModificationTime(fullFilePath),
@@ -336,11 +403,12 @@ export const FileWriteTool = buildTool({
       limit: undefined,
     })
 
-    // Log when writing to CLAUDE.md
+    // 17. 单独记录 CLAUDE.md 写入事件，供产品分析使用。
     if (fullFilePath.endsWith(`${sep}CLAUDE.md`)) {
       logEvent('tengu_write_claudemd', {})
     }
 
+    // 18. 远程环境并且实验开关开启时，补充计算单文件 git diff。
     let gitDiff: ToolUseDiff | undefined
     if (
       isEnvTruthy(process.env.CLAUDE_CODE_REMOTE) &&
@@ -356,6 +424,7 @@ export const FileWriteTool = buildTool({
       })
     }
 
+    // 19. 已有旧内容说明本次是更新文件，需要生成结构化补丁并记录更新事件。
     if (oldContent) {
       const patch = getPatchForDisplay({
         filePath: file_path,
@@ -377,7 +446,7 @@ export const FileWriteTool = buildTool({
         originalFile: oldContent,
         ...(gitDiff && { gitDiff }),
       }
-      // Track lines added and removed for file updates, right before yielding result
+      // 20. 在返回前统计更新产生的增删行数。
       countLinesChanged(patch)
 
       logFileOperation({
@@ -392,6 +461,7 @@ export const FileWriteTool = buildTool({
       }
     }
 
+    // 21. 没有旧内容说明本次是创建文件，返回空补丁并把所有内容计为新增。
     const data = {
       type: 'create' as const,
       filePath: file_path,
@@ -401,7 +471,7 @@ export const FileWriteTool = buildTool({
       ...(gitDiff && { gitDiff }),
     }
 
-    // For creation of new files, count all lines as additions, right before yielding the result
+    // 22. 新建文件没有旧补丁，直接按写入内容统计新增行数。
     countLinesChanged([], content)
 
     logFileOperation({
@@ -415,6 +485,13 @@ export const FileWriteTool = buildTool({
       data,
     }
   },
+  /**
+   * 将内部工具结果映射为模型协议中的 tool_result 块。
+   *
+   * @param param0 写入结果中的文件路径和操作类型。
+   * @param toolUseID 当前工具调用的唯一标识。
+   * @returns 可发送给模型的工具结果消息块。
+   */
   mapToolResultToToolResultBlockParam({ filePath, type }, toolUseID) {
     switch (type) {
       case 'create':
