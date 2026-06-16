@@ -8,7 +8,8 @@
 - 不写单元测试或临时 `*.test.ts` 文件。
 - 所有测试数据写入 `D:\tmp`。
 - 从当前项目目录构建并定位 CLI，后续在测试项目目录中通过 `$env:FREE_CODE_CLI` 调用。
-- 使用独立 `CLAUDE_CONFIG_DIR`，避免污染真实用户配置和项目仓库下的 `.claude`。
+- 默认使用当前机器已经登录的 CLI 配置；不要临时指定一个空的 `CLAUDE_CONFIG_DIR`，否则 `--print` 会报 `Not logged in`。
+- `--print` 命令统一使用 `--no-session-persistence`，避免把测试会话写入历史记录。
 
 ## 1. 文件功能说明
 
@@ -59,11 +60,10 @@ if (!(Test-Path .\cli.exe)) {
 
 $env:FREE_CODE_CLI = (Resolve-Path .\cli.exe).Path
 $env:FREE_CODE_E2E_ROOT = "D:\tmp\free-code-glob-tool-e2e"
-$env:CLAUDE_CONFIG_DIR = Join-Path $env:FREE_CODE_E2E_ROOT "claude-config"
+Remove-Item Env:\CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
 
 Remove-Item -Recurse -Force $env:FREE_CODE_E2E_ROOT -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $env:FREE_CODE_E2E_ROOT | Out-Null
-New-Item -ItemType Directory -Force $env:CLAUDE_CONFIG_DIR | Out-Null
 
 $Project = Join-Path $env:FREE_CODE_E2E_ROOT "project"
 New-Item -ItemType Directory -Force "$Project\src\components" | Out-Null
@@ -79,7 +79,7 @@ New-Item -ItemType Directory -Force "$Project\many" | Out-Null
 - `npm run build` 成功。
 - `.\cli.exe` 存在。
 - `$env:FREE_CODE_CLI` 指向当前项目目录下的构建产物。
-- `$env:CLAUDE_CONFIG_DIR` 指向 `D:\tmp\free-code-glob-tool-e2e\claude-config`。
+- 当前 PowerShell 会话中没有临时 `CLAUDE_CONFIG_DIR`，CLI 使用当前机器已登录的默认配置。
 - 版本号正常输出。
 
 ### 2.3 准备测试项目文件
@@ -119,7 +119,7 @@ Set-Location $Project
 ### 操作步骤
 
 ```powershell
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 3 --allowed-tools "Glob" "请用 Glob 查找 **/*.ts，并列出命中的文件路径，不要读取文件内容。"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 3 --allowed-tools "Glob" -- "请用 Glob 查找 src/**/*.ts，并列出命中的文件路径，不要读取文件内容。"
 ```
 
 ### 期望输出
@@ -145,7 +145,7 @@ src/utils/format.ts
 ### 操作步骤
 
 ```powershell
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 3 --allowed-tools "Glob" "请用 Glob 在 src/components 目录下查找 *.tsx，并列出结果。"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 3 --allowed-tools "Glob" -- "请用 Glob 在 src/components 目录下查找 *.tsx，并列出结果。"
 ```
 
 ### 期望输出
@@ -177,7 +177,7 @@ src/app.ts
 ### 操作步骤
 
 ```powershell
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 3 --allowed-tools "Glob" "请用 Glob 查找 **/*.does-not-exist，告诉我是否找到文件。"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 3 --allowed-tools "Glob" -- "请用 Glob 查找 **/*.does-not-exist，告诉我是否找到文件。"
 ```
 
 ### 期望输出
@@ -199,7 +199,7 @@ No files found
 ### 操作步骤
 
 ```powershell
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 3 --allowed-tools "Glob" "请用 Glob 在 missing-dir 目录下查找 **/*.ts，并把工具错误总结出来。"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 3 --allowed-tools "Glob" -- "请用 Glob 在 missing-dir 目录下查找 **/*.ts，并把工具错误总结出来。"
 ```
 
 ### 期望输出
@@ -226,7 +226,7 @@ Directory does not exist
 ### 操作步骤
 
 ```powershell
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 3 --allowed-tools "Glob" "请用 Glob 把 path 设置为 src/not-a-dir.txt，并查找 *.ts。请总结工具错误。"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 3 --allowed-tools "Glob" -- "请用 Glob 把 path 设置为 src/not-a-dir.txt，并查找 *.ts。请总结工具错误。"
 ```
 
 ### 期望输出
@@ -256,7 +256,7 @@ D:\tmp\free-code-glob-tool-e2e\project\src
 故意传入漏掉 `project` 的目录：
 
 ```powershell
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 3 --allowed-tools "Glob" "请用 Glob 在 D:\tmp\free-code-glob-tool-e2e\src 目录下查找 *.ts。如果工具提示了建议路径，请说明建议路径。"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 3 --allowed-tools "Glob" -- "请用 Glob 在 D:\tmp\free-code-glob-tool-e2e\src 目录下查找 *.ts。如果工具提示了建议路径，请说明建议路径。"
 ```
 
 ### 期望输出
@@ -280,7 +280,7 @@ D:\tmp\free-code-glob-tool-e2e\project\src
 ### 操作步骤
 
 ```powershell
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 3 --allowed-tools "Glob" "请用 Glob 在 many 目录下查找 *.fixture.ts，并说明结果是否被截断、返回了多少个文件。"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 3 --allowed-tools "Glob" -- "请用 Glob 在 many 目录下查找 *.fixture.ts，并说明结果是否被截断、返回了多少个文件。"
 ```
 
 ### 期望输出
@@ -315,7 +315,7 @@ D:\tmp\free-code-glob-tool-e2e\project\src
 
 ```powershell
 $before = Get-FileHash "$Project\src\app.ts"
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 3 --allowed-tools "Glob" "请用 Glob 查找 src/**/*.ts，不要读取或修改任何文件。"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 3 --allowed-tools "Glob" -- "请用 Glob 查找 src/**/*.ts，不要读取或修改任何文件。"
 $after = Get-FileHash "$Project\src\app.ts"
 $before.Hash -eq $after.Hash
 ```
@@ -337,7 +337,6 @@ Set-Location (Split-Path $env:FREE_CODE_CLI)
 Remove-Item -Recurse -Force $env:FREE_CODE_E2E_ROOT -ErrorAction SilentlyContinue
 Remove-Item Env:\FREE_CODE_E2E_ROOT -ErrorAction SilentlyContinue
 Remove-Item Env:\FREE_CODE_CLI -ErrorAction SilentlyContinue
-Remove-Item Env:\CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
 ```
 
 ## 12. 验收标准

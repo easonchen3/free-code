@@ -8,7 +8,8 @@
 - 不写单元测试或临时 `*.test.ts` 文件。
 - 所有测试数据写入 `D:\tmp`。
 - 从当前项目目录构建并定位 CLI，后续在测试项目目录中通过 `$env:FREE_CODE_CLI` 调用。
-- 使用独立 `CLAUDE_CONFIG_DIR`，避免污染真实用户配置和项目仓库下的 `.claude`。
+- 默认使用当前机器已经登录的 CLI 配置；不要临时指定一个空的 `CLAUDE_CONFIG_DIR`，否则 `--print` 会报 `Not logged in`。
+- `--print` 命令统一使用 `--no-session-persistence`，避免把测试会话写入历史记录。
 
 ## 1. 文件功能说明
 
@@ -64,11 +65,10 @@ if (!(Test-Path .\cli.exe)) {
 
 $env:FREE_CODE_CLI = (Resolve-Path .\cli.exe).Path
 $env:FREE_CODE_E2E_ROOT = "D:\tmp\free-code-file-write-tool-e2e"
-$env:CLAUDE_CONFIG_DIR = Join-Path $env:FREE_CODE_E2E_ROOT "claude-config"
+Remove-Item Env:\CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
 
 Remove-Item -Recurse -Force $env:FREE_CODE_E2E_ROOT -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $env:FREE_CODE_E2E_ROOT | Out-Null
-New-Item -ItemType Directory -Force $env:CLAUDE_CONFIG_DIR | Out-Null
 
 $Project = Join-Path $env:FREE_CODE_E2E_ROOT "project"
 New-Item -ItemType Directory -Force "$Project\src" | Out-Null
@@ -82,7 +82,7 @@ New-Item -ItemType Directory -Force "$Project\.claude\skills\write-trigger-skill
 - `npm run build` 成功。
 - `.\cli.exe` 存在。
 - `$env:FREE_CODE_CLI` 指向当前项目目录下的构建产物。
-- `$env:CLAUDE_CONFIG_DIR` 指向 `D:\tmp\free-code-file-write-tool-e2e\claude-config`。
+- 当前 PowerShell 会话中没有临时 `CLAUDE_CONFIG_DIR`，CLI 使用当前机器已登录的默认配置。
 - 版本号正常输出。
 
 ### 2.3 准备测试项目文件
@@ -125,7 +125,7 @@ Set-Location $Project
 
 ```powershell
 $Target = Join-Path $Project "src\created.txt"
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 5 --allowed-tools "Write,Read" --permission-mode acceptEdits "请使用 Write 工具创建文件 $Target，内容必须只有一行：WRITE_CREATE_OK。创建后读取它确认。"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 5 --allowed-tools "Write,Read" --permission-mode acceptEdits -- "请使用 Write 工具创建文件 $Target，内容必须只有一行：WRITE_CREATE_OK。创建后读取它确认。"
 Get-Content $Target
 ```
 
@@ -151,7 +151,7 @@ WRITE_CREATE_OK
 
 ```powershell
 $NestedTarget = Join-Path $Project "generated\nested\deep\created.ts"
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 5 --allowed-tools "Write,Read" --permission-mode acceptEdits "请使用 Write 工具创建文件 $NestedTarget，内容必须是：export const nestedWrite = 'WRITE_NESTED_OK'。创建后读取它确认。"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 5 --allowed-tools "Write,Read" --permission-mode acceptEdits -- "请使用 Write 工具创建文件 $NestedTarget，内容必须是：export const nestedWrite = 'WRITE_NESTED_OK'。创建后读取它确认。"
 Get-Content $NestedTarget
 Test-Path (Split-Path $NestedTarget)
 ```
@@ -186,7 +186,7 @@ True
 
 ```powershell
 $Existing = Join-Path $Project "src\existing.txt"
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 3 --allowed-tools "Write" --permission-mode acceptEdits "请直接使用 Write 工具把 $Existing 的完整内容覆盖为 SHOULD_NOT_WRITE，不要读取文件。请总结工具结果。"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 3 --allowed-tools "Write" --permission-mode acceptEdits -- "请直接使用 Write 工具把 $Existing 的完整内容覆盖为 SHOULD_NOT_WRITE，不要读取文件。请总结工具结果。"
 Get-Content $Existing
 ```
 
@@ -221,7 +221,7 @@ line three
 
 ```powershell
 $Existing = Join-Path $Project "src\existing.txt"
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 6 --allowed-tools "Read,Write" --permission-mode acceptEdits "请先读取 $Existing，然后使用 Write 工具把它完整覆盖为三行：UPDATED_ONE、UPDATED_TWO、UPDATED_THREE。完成后读取文件确认。"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 6 --allowed-tools "Read,Write" --permission-mode acceptEdits -- "请先读取 $Existing，然后使用 Write 工具把它完整覆盖为三行：UPDATED_ONE、UPDATED_TWO、UPDATED_THREE。完成后读取文件确认。"
 Get-Content $Existing
 ```
 
@@ -304,7 +304,7 @@ external changed content
 
 ```powershell
 $Crlf = Join-Path $Project "src\crlf-existing.txt"
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 6 --allowed-tools "Read,Write" --permission-mode acceptEdits "请先读取 $Crlf，然后使用 Write 工具把它完整覆盖为三行：LF_ONE、LF_TWO、LF_THREE。"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 6 --allowed-tools "Read,Write" --permission-mode acceptEdits -- "请先读取 $Crlf，然后使用 Write 工具把它完整覆盖为三行：LF_ONE、LF_TWO、LF_THREE。"
 
 $bytes = [System.IO.File]::ReadAllBytes($Crlf)
 ($bytes | Where-Object { $_ -eq 13 }).Count
@@ -375,7 +375,7 @@ True
 
 ```powershell
 $Target = Join-Path $Project "src\write-tool-only.txt"
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 5 --allowed-tools "Write,Read" --permission-mode acceptEdits "请创建 $Target，内容只有 WRITE_TOOL_ONLY_OK。不要使用 Bash 或 PowerShell。创建后读取确认。"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 5 --allowed-tools "Write,Read" --permission-mode acceptEdits -- "请创建 $Target，内容只有 WRITE_TOOL_ONLY_OK。不要使用 Bash 或 PowerShell。创建后读取确认。"
 Get-Content $Target
 ```
 
@@ -401,7 +401,7 @@ WRITE_TOOL_ONLY_OK
 ```powershell
 $LongTarget = Join-Path $Project "src\long-created.txt"
 $Prompt = "请使用 Write 工具创建文件 $LongTarget，内容为 20 行，依次是 LINE_01 到 LINE_20。创建后只回答是否创建成功。"
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 5 --allowed-tools "Write" --permission-mode acceptEdits $Prompt
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 5 --allowed-tools "Write" --permission-mode acceptEdits -- $Prompt
 
 (Get-Content $LongTarget).Count
 Get-Content $LongTarget
@@ -433,7 +433,6 @@ Set-Location (Split-Path $env:FREE_CODE_CLI)
 Remove-Item -Recurse -Force $env:FREE_CODE_E2E_ROOT -ErrorAction SilentlyContinue
 Remove-Item Env:\FREE_CODE_E2E_ROOT -ErrorAction SilentlyContinue
 Remove-Item Env:\FREE_CODE_CLI -ErrorAction SilentlyContinue
-Remove-Item Env:\CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
 ```
 
 ## 13. 验收标准

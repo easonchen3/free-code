@@ -8,7 +8,8 @@
 - 不写单元测试或临时 `*.test.ts` 文件。
 - 所有测试数据写入 `D:\tmp`。
 - 从当前项目目录构建并定位 CLI，后续在测试项目目录中通过 `$env:FREE_CODE_CLI` 调用。
-- 使用独立 `CLAUDE_CONFIG_DIR`，避免污染真实用户配置和项目仓库下的 `.claude`。
+- 默认使用当前机器已经登录的 CLI 配置；不要临时指定一个空的 `CLAUDE_CONFIG_DIR`，否则 `--print` 会报 `Not logged in`。
+- `--print` 命令统一使用 `--no-session-persistence`，避免把测试会话写入历史记录。
 
 ## 1. 文件功能说明
 
@@ -70,11 +71,10 @@ if (!(Test-Path .\cli.exe)) {
 
 $env:FREE_CODE_CLI = (Resolve-Path .\cli.exe).Path
 $env:FREE_CODE_E2E_ROOT = "D:\tmp\free-code-frontmatter-e2e"
-$env:CLAUDE_CONFIG_DIR = Join-Path $env:FREE_CODE_E2E_ROOT "claude-config"
+Remove-Item Env:\CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
 
 Remove-Item -Recurse -Force $env:FREE_CODE_E2E_ROOT -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $env:FREE_CODE_E2E_ROOT | Out-Null
-New-Item -ItemType Directory -Force $env:CLAUDE_CONFIG_DIR | Out-Null
 
 $Project = Join-Path $env:FREE_CODE_E2E_ROOT "project"
 New-Item -ItemType Directory -Force "$Project\.claude\skills\frontmatter-visible" | Out-Null
@@ -92,7 +92,7 @@ New-Item -ItemType Directory -Force "$Project\docs" | Out-Null
 - `npm run build` 成功。
 - `.\cli.exe` 存在。
 - `$env:FREE_CODE_CLI` 指向当前项目目录下的构建产物。
-- `$env:CLAUDE_CONFIG_DIR` 指向 `D:\tmp\free-code-frontmatter-e2e\claude-config`。
+- 当前 PowerShell 会话中没有临时 `CLAUDE_CONFIG_DIR`，CLI 使用当前机器已登录的默认配置。
 - 版本号正常输出。
 
 ### 2.3 准备测试项目文件
@@ -166,7 +166,7 @@ Set-Location $Project
 ### 操作步骤
 
 ```powershell
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 3 "/frontmatter-visible"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 3 "/frontmatter-visible"
 ```
 
 ### 期望输出
@@ -190,7 +190,7 @@ FRONTMATTER_VISIBLE_OK
 ### 操作步骤
 
 ```powershell
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 3 "/frontmatter-hidden"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 3 "/frontmatter-hidden"
 ```
 
 ### 期望输出
@@ -216,7 +216,7 @@ If this body appears from direct slash invocation
 ### 操作步骤
 
 ```powershell
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 3 "/frontmatter-command test"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 3 "/frontmatter-command test"
 ```
 
 ### 期望输出
@@ -322,7 +322,7 @@ Reply exactly:
 FRONTMATTER_BAD_SHELL_LOADED
 '@ | Set-Content -Encoding UTF8 ".claude\skills\frontmatter-bad-shell\SKILL.md"
 
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 3 "/frontmatter-bad-shell"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 3 "/frontmatter-bad-shell"
 ```
 
 ### 期望输出
@@ -359,7 +359,7 @@ Reply exactly:
 FRONTMATTER_BAD_DESCRIPTION_BODY_OK
 '@ | Set-Content -Encoding UTF8 ".claude\skills\frontmatter-bad-description\SKILL.md"
 
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 3 "/frontmatter-bad-description"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 3 "/frontmatter-bad-description"
 ```
 
 ### 期望输出
@@ -391,7 +391,7 @@ Reply exactly:
 FRONTMATTER_BROKEN_YAML_BODY_VISIBLE
 '@ | Set-Content -Encoding UTF8 ".claude\skills\frontmatter-broken-yaml\SKILL.md"
 
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 3 "/context"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 3 "/context"
 ```
 
 ### 期望输出
@@ -420,7 +420,7 @@ Reply exactly:
 FRONTMATTER_NO_METADATA_COMMAND_OK
 '@ | Set-Content -Encoding UTF8 ".claude\commands\no-frontmatter-command.md"
 
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 3 "/no-frontmatter-command"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 3 "/no-frontmatter-command"
 ```
 
 ### 期望输出
@@ -436,7 +436,6 @@ Set-Location (Split-Path $env:FREE_CODE_CLI)
 Remove-Item -Recurse -Force $env:FREE_CODE_E2E_ROOT -ErrorAction SilentlyContinue
 Remove-Item Env:\FREE_CODE_E2E_ROOT -ErrorAction SilentlyContinue
 Remove-Item Env:\FREE_CODE_CLI -ErrorAction SilentlyContinue
-Remove-Item Env:\CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
 ```
 
 ## 13. 验收标准

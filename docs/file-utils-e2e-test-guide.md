@@ -8,7 +8,8 @@
 - 不写单元测试或临时 `*.test.ts` 文件。
 - 所有测试数据写入 `D:\tmp`。
 - 从当前项目目录构建并定位 CLI，后续在测试项目目录中通过 `$env:FREE_CODE_CLI` 调用。
-- 使用独立 `CLAUDE_CONFIG_DIR`，避免污染真实用户配置和项目仓库下的 `.claude`。
+- 默认使用当前机器已经登录的 CLI 配置；不要临时指定一个空的 `CLAUDE_CONFIG_DIR`，否则 `--print` 会报 `Not logged in`。
+- `--print` 命令统一使用 `--no-session-persistence`，避免把测试会话写入历史记录。
 
 ## 1. 文件功能说明
 
@@ -56,11 +57,10 @@ if (!(Test-Path .\cli.exe)) {
 
 $env:FREE_CODE_CLI = (Resolve-Path .\cli.exe).Path
 $env:FREE_CODE_E2E_ROOT = "D:\tmp\free-code-file-utils-e2e"
-$env:CLAUDE_CONFIG_DIR = Join-Path $env:FREE_CODE_E2E_ROOT "claude-config"
+Remove-Item Env:\CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
 
 Remove-Item -Recurse -Force $env:FREE_CODE_E2E_ROOT -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $env:FREE_CODE_E2E_ROOT | Out-Null
-New-Item -ItemType Directory -Force $env:CLAUDE_CONFIG_DIR | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $env:FREE_CODE_E2E_ROOT "project\src") | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $env:FREE_CODE_E2E_ROOT "project\empty-dir") | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $env:FREE_CODE_E2E_ROOT "project\non-empty-dir") | Out-Null
@@ -73,7 +73,7 @@ New-Item -ItemType Directory -Force (Join-Path $env:FREE_CODE_E2E_ROOT "project\
 - `npm run build` 成功。
 - `.\cli.exe` 存在。
 - `$env:FREE_CODE_CLI` 指向当前项目目录下的构建产物。
-- `$env:CLAUDE_CONFIG_DIR` 指向 `D:\tmp\free-code-file-utils-e2e\claude-config`。
+- 当前 PowerShell 会话中没有临时 `CLAUDE_CONFIG_DIR`，CLI 使用当前机器已登录的默认配置。
 - 版本号正常输出。
 
 ### 2.3 准备测试项目文件
@@ -88,7 +88,7 @@ Set-Content -Path "$Project\src\tabs.txt" -Value "`tfirst`n`t`tsecond`nmid`tline
 Set-Content -Path "$Project\src\target.txt" -Value "cwd-correction-ok" -NoNewline -Encoding UTF8
 Set-Content -Path "$Project\non-empty-dir\item.txt" -Value "not empty" -Encoding UTF8
 
-$large = "0123456789abcdef" * 20000
+$large = "0123456789abcdef" * 25000
 Set-Content -Path "$Project\src\large.txt" -Value $large -NoNewline -Encoding UTF8
 
 Get-ChildItem -Recurse $Project
@@ -110,7 +110,7 @@ Set-Location $Project
 ### 操作步骤
 
 ```powershell
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 3 --allowed-tools "Read" "请读取 src/sample-lf.txt，并只回答文件的三行内容。不要改文件。"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 3 --allowed-tools "Read" -- "请读取 src/sample-lf.txt，并只回答文件的三行内容。不要改文件。"
 ```
 
 ### 期望输出
@@ -138,7 +138,7 @@ gamma
 ### 操作步骤
 
 ```powershell
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 3 --allowed-tools "Read" "请尝试读取 src/module.js。如果工具提示有相似文件，请说明它提示了哪个文件；不要读取其它文件。"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 3 --allowed-tools "Read" -- "请尝试读取 src/module.js。如果工具提示有相似文件，请说明它提示了哪个文件；不要读取其它文件。"
 ```
 
 ### 期望输出
@@ -169,10 +169,30 @@ module.ts
 D:\tmp\free-code-file-utils-e2e\project\src\target.txt
 ```
 
-故意读取漏掉 `project` 的路径：
+先确认当前目录、真实文件和故意写错的路径符合本用例前提：
 
 ```powershell
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 5 --allowed-tools "Read" "请读取 D:\tmp\free-code-file-utils-e2e\src\target.txt。如果工具提示当前工作目录下存在修正路径，请继续读取修正后的文件，并只回答最终文件内容。"
+$ActualTarget = Join-Path $Project "src\target.txt"
+$MissingTarget = Join-Path $env:FREE_CODE_E2E_ROOT "src\target.txt"
+
+Get-Location
+Test-Path $ActualTarget
+Test-Path $MissingTarget
+Get-Content $ActualTarget
+```
+
+期望预检输出：
+
+- `Get-Location` 的末尾是 `D:\tmp\free-code-file-utils-e2e\project`。
+- `Test-Path $ActualTarget` 输出 `True`。
+- `Test-Path $MissingTarget` 输出 `False`。
+- `Get-Content $ActualTarget` 输出 `cwd-correction-ok`。
+
+故意读取漏掉 `project` 的路径。这里把 `max-turns` 设为 8，避免模型在收到路径修正提示后没有足够回合继续读取：
+
+```powershell
+$Prompt = "请先尝试读取 $MissingTarget。这个路径预期不存在；如果 Read 工具返回建议路径或提示当前工作目录下存在修正路径，请继续读取 $ActualTarget。最后只回答最终文件内容。"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 8 --allowed-tools "Read" -- $Prompt
 ```
 
 ### 期望输出
@@ -197,7 +217,7 @@ cwd-correction-ok
 ### 操作步骤
 
 ```powershell
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 5 --allowed-tools "Read,Edit" --permission-mode acceptEdits "请把 src/sample-crlf.txt 中的 two 改成 TWO_EDITED，只做这一处修改。"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 5 --allowed-tools "Read,Edit" --permission-mode acceptEdits -- "请把 src/sample-crlf.txt 中的 two 改成 TWO_EDITED，只做这一处修改。"
 ```
 
 检查文件内容和 CR/LF 数量：
@@ -269,7 +289,7 @@ Set-Content -Path "D:\tmp\free-code-file-utils-e2e\project\src\conflict.txt" -Va
 ### 操作步骤
 
 ```powershell
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 3 --allowed-tools "Read" "请读取 src/tabs.txt，并说明第一行、第二行、第三行的可见文本。不要改文件。"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 3 --allowed-tools "Read" -- "请读取 src/tabs.txt，并说明第一行、第二行、第三行的可见文本。不要改文件。"
 ```
 
 检查磁盘文件仍包含 tab：
@@ -298,8 +318,25 @@ True
 
 ### 操作步骤
 
+先确认测试文件确实超过读取上限。`src/utils/file.ts` 中的读取上限约为 `0.25 * 1024 * 1024` 字节，所以这里期望文件大小大于 `262144` 字节：
+
 ```powershell
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 3 --allowed-tools "Read" "请读取 src/large.txt，并告诉我是否可以完整读取。不要使用 Bash。"
+$LargePath = Join-Path $Project "src\large.txt"
+(Get-Item $LargePath).Length
+```
+
+如果输出小于或等于 `262144`，重新生成大文件后再继续：
+
+```powershell
+$large = "0123456789abcdef" * 25000
+Set-Content -Path $LargePath -Value $large -NoNewline -Encoding UTF8
+(Get-Item $LargePath).Length
+```
+
+再通过 CLI 读取。这里把 `max-turns` 设为 8，避免工具返回限制信息后模型没有足够回合整理最终回答：
+
+```powershell
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 8 --allowed-tools "Read" -- "请尝试用 Read 读取 src/large.txt。不要使用 Bash。请完整复述 Read 工具返回的限制或错误信息，并说明是否被文件大小限制拦截。"
 ```
 
 ### 期望输出
@@ -316,7 +353,7 @@ True
 ### 操作步骤
 
 ```powershell
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 5 --allowed-tools "Write,Read" --permission-mode acceptEdits "请创建 src/generated-by-freecode.txt，内容只有一行：created by free-code file utils e2e。创建后读取它确认。"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 5 --allowed-tools "Write,Read" --permission-mode acceptEdits -- "请创建 src/generated-by-freecode.txt，内容只有一行：created by free-code file utils e2e。创建后读取它确认。"
 ```
 
 检查文件：
@@ -340,7 +377,7 @@ created by free-code file utils e2e
 ### 操作步骤
 
 ```powershell
-& $env:FREE_CODE_CLI --print --output-format text --max-turns 3 --allowed-tools "Read" "请读取 SRC/SAMPLE-LF.TXT，并回答它是否等价于 src/sample-lf.txt。"
+& $env:FREE_CODE_CLI --print --no-session-persistence --output-format text --max-turns 3 --allowed-tools "Read" -- "请读取 SRC/SAMPLE-LF.TXT，并回答它是否等价于 src/sample-lf.txt。"
 ```
 
 ### 期望输出
@@ -365,7 +402,6 @@ Set-Location (Split-Path $env:FREE_CODE_CLI)
 Remove-Item -Recurse -Force $env:FREE_CODE_E2E_ROOT -ErrorAction SilentlyContinue
 Remove-Item Env:\FREE_CODE_E2E_ROOT -ErrorAction SilentlyContinue
 Remove-Item Env:\FREE_CODE_CLI -ErrorAction SilentlyContinue
-Remove-Item Env:\CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
 ```
 
 ## 13. 验收标准
