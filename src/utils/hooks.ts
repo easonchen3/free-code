@@ -1,7 +1,11 @@
-// biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
+// biome-ignore-all assist/source/organizeImports: ANT-ONLY 导入标记依赖当前顺序，不能自动重排。
 /**
- * Hooks are user-defined shell commands that can be executed at various points
- * in Claude Code's lifecycle.
+ * Hook 工具函数集合。
+ *
+ * 本文件负责把用户、插件、技能和会话注册的 hook 配置统一匹配、执行、解析和聚合。
+ * hook 可以在工具调用、会话启动/结束、压缩、权限请求、文件变化等生命周期节点运行。
+ * 这些 hook 会执行外部命令、HTTP 调用或回调，因此所有入口都需要关注信任状态、超时、
+ * 权限策略、输出协议和阻塞语义。
  */
 import { basename } from 'path'
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process'
@@ -163,16 +167,27 @@ import { jsonStringify, jsonParse } from './slowOperations.js'
 import { isEnvTruthy } from './envUtils.js'
 import { errorMessage, getErrnoCode } from './errors.js'
 
+/**
+ * 工具类 hook 的默认执行超时时间。
+ *
+ * 场景：PreToolUse、PostToolUse 等围绕工具调用运行的 hook。
+ * 单位：毫秒；当前值为 10 分钟。
+ */
 const TOOL_HOOK_EXECUTION_TIMEOUT_MS = 10 * 60 * 1000
 
 /**
- * SessionEnd hooks run during shutdown/clear and need a much tighter bound
- * than TOOL_HOOK_EXECUTION_TIMEOUT_MS. This value is used by callers as both
- * the per-hook default timeout AND the overall AbortSignal cap (hooks run in
- * parallel, so one value suffices). Overridable via env var for users whose
- * teardown scripts need more time.
+ * SessionEnd hook 的默认超时时间。
+ *
+ * 场景：会话关闭或清理时运行的收尾脚本，需要比工具 hook 更短的等待窗口。
+ * 单位：毫秒；调用方会同时把它作为单个 hook 默认超时和整体 AbortSignal 上限。
+ * 可以通过 CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS 覆盖。
  */
 const SESSION_END_HOOK_TIMEOUT_MS_DEFAULT = 1500
+/**
+ * 读取 SessionEnd hook 的超时时间配置。
+ *
+ * @returns 有效环境变量覆盖值，或默认的 SessionEnd 超时时间，单位为毫秒。
+ */
 export function getSessionEndHookTimeoutMs(): number {
   const raw = process.env.CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS
   const parsed = raw ? parseInt(raw, 10) : NaN
@@ -181,6 +196,12 @@ export function getSessionEndHookTimeoutMs(): number {
     : SESSION_END_HOOK_TIMEOUT_MS_DEFAULT
 }
 
+/**
+ * 把异步 hook 交给后台流程继续执行。
+ *
+ * @param param0 后台执行所需的进程、hook 元数据和命令信息。
+ * @returns 是否成功转入后台执行；失败时调用方需要继续按同步路径处理。
+ */
 function executeInBackground({
   processId,
   hookId,
@@ -203,22 +224,11 @@ function executeInBackground({
   pluginId?: string
 }): boolean {
   if (asyncRewake) {
-    // asyncRewake hooks bypass the registry entirely. On completion, if exit
-    // code 2 (blocking error), enqueue as a task-notification so it wakes the
-    // model via useQueueProcessor (idle) or gets injected mid-query via
-    // queued_command attachments (busy).
-    //
-    // NOTE: We deliberately do NOT call shellCommand.background() here, because
-    // it calls taskOutput.spillToDisk() which breaks in-memory stdout/stderr
-    // capture (getStderr() returns '' in disk mode). The StreamWrappers stay
-    // attached and pipe data into the in-memory TaskOutput buffers. The abort
-    // handler already no-ops on 'interrupt' reason (user submitted a new
-    // message), so the hook survives new prompts. A hard cancel (Escape) WILL
-    // kill the hook via the abort handler, which is the desired behavior.
+    // 1. asyncRewake 不进入普通异步注册表；完成后如果返回阻塞码 2，就转成任务通知唤醒模型。
+    // 2. 这里刻意不调用 background()，因为它会把输出落盘，导致内存中的 stdout/stderr 无法读取。
+    // 3. interrupt 场景允许 hook 跨用户新消息继续运行；硬取消仍会通过 abort 结束进程。
     void shellCommand.result.then(async result => {
-      // result resolves on 'exit', but stdio 'data' events may still be
-      // pending. Yield to I/O so the StreamWrapper data handlers drain into
-      // TaskOutput before we read it.
+      // 4. 进程 exit 后 stdio 事件可能还没完全排空，先让出一次事件循环再读取输出。
       await new Promise(resolve => setImmediate(resolve))
       const stdout = await shellCommand.taskOutput.getStdout()
       const stderr = shellCommand.taskOutput.getStderr()
@@ -245,11 +255,12 @@ function executeInBackground({
     return true
   }
 
-  // TaskOutput on the ShellCommand accumulates data — no stream listeners needed
+  // 1. 普通异步 hook 由 ShellCommand 自己累积输出，不需要额外挂流监听器。
   if (!shellCommand.background(processId)) {
     return false
   }
 
+  // 2. 注册待完成的异步 hook，后续由异步 hook 注册表统一回收和展示。
   registerPendingAsyncHook({
     processId,
     hookId,
@@ -265,44 +276,37 @@ function executeInBackground({
 }
 
 /**
- * Checks if a hook should be skipped due to lack of workspace trust.
+ * 判断当前是否应该因为工作区未受信任而跳过 hook。
  *
- * ALL hooks require workspace trust because they execute arbitrary commands from
- * .claude/settings.json. This is a defense-in-depth security measure.
+ * 所有 hook 都可能执行来自配置文件的任意命令，因此交互模式下必须先确认工作区信任。
+ * 该检查用于防止信任弹窗前、用户拒绝信任后或未来新增路径中意外执行 hook。
  *
- * Context: Hooks are captured via captureHooksConfigSnapshot() before the trust
- * dialog is shown. While most hooks won't execute until after trust is established
- * through normal program flow, enforcing trust for ALL hooks prevents:
- * - Future bugs where a hook might accidentally execute before trust
- * - Any codepath that might trigger hooks before trust dialog
- * - Security issues from hook execution in untrusted workspaces
- *
- * Historical vulnerabilities that prompted this check:
- * - SessionEnd hooks executing when user declines trust dialog
- * - SubagentStop hooks executing when subagent completes before trust
- *
- * @returns true if hook should be skipped, false if it should execute
+ * @returns true 表示应跳过 hook；false 表示可以继续执行。
  */
 export function shouldSkipHookDueToTrust(): boolean {
-  // In non-interactive mode (SDK), trust is implicit - always execute
+  // 1. 非交互 SDK 模式默认由调用方承担信任边界，因此不阻止 hook。
   const isInteractive = !getIsNonInteractiveSession()
   if (!isInteractive) {
     return false
   }
 
-  // In interactive mode, ALL hooks require trust
+  // 2. 交互模式下必须等用户接受工作区信任后才能执行任意 hook。
   const hasTrust = checkHasTrustDialogAccepted()
   return !hasTrust
 }
 
 /**
- * Creates the base hook input that's common to all hook types
+ * 创建所有 hook 共享的基础输入字段。
+ *
+ * @param permissionMode 当前权限模式，可为空。
+ * @param sessionId 指定会话 ID；未传入时使用当前主会话 ID。
+ * @param agentInfo 可选代理信息，用于区分主线程和子代理 hook。
+ * @returns 包含会话、转录文件、工作目录、权限模式和代理信息的基础输入。
  */
 export function createBaseHookInput(
   permissionMode?: string,
   sessionId?: string,
-  // Typed narrowly (not ToolUseContext) so callers can pass toolUseContext
-  // directly via structural typing without this function depending on Tool.ts.
+  // 1. 这里保持窄类型，调用方可以用结构类型直接传入 toolUseContext，而不让本函数依赖 Tool.ts。
   agentInfo?: { agentId?: string; agentType?: string },
 ): {
   session_id: string
@@ -313,9 +317,7 @@ export function createBaseHookInput(
   agent_type?: string
 } {
   const resolvedSessionId = sessionId ?? getSessionId()
-  // agent_type: subagent's type (from toolUseContext) takes precedence over
-  // the session's --agent flag. Hooks use agent_id presence to distinguish
-  // subagent calls from main-thread calls in a --agent session.
+  // 2. 子代理类型优先于会话级 --agent 标记，hook 可通过 agent_id 判断调用来自子代理还是主线程。
   const resolvedAgentType = agentInfo?.agentType ?? getMainThreadAgentType()
   return {
     session_id: resolvedSessionId,
@@ -327,67 +329,123 @@ export function createBaseHookInput(
   }
 }
 
+/**
+ * hook 阻塞错误信息。
+ *
+ * 场景：hook 明确阻止后续流程时，携带给模型或调用方的错误说明和来源命令。
+ */
 export interface HookBlockingError {
+  /** hook 输出的阻塞原因。 */
   blockingError: string
+  /** 产生阻塞结果的命令名称或命令内容。 */
   command: string
 }
 
-/** Re-export ElicitResult from MCP SDK as ElicitationResponse for backward compat. */
+/** 为兼容旧调用方，把 MCP SDK 的 ElicitResult 重新命名为 ElicitationResponse。 */
 export type ElicitationResponse = ElicitResult
 
+/**
+ * 单个 hook 的执行结果。
+ *
+ * 场景：executeHooks 内部对 command、prompt、agent、http、callback、function hook 的统一结果模型。
+ * 其中 outcome 表示执行状态，其他字段按 hook 类型按需携带。
+ */
 export interface HookResult {
+  /** 需要展示给用户的附件消息。 */
   message?: HookResultMessage
+  /** 需要注入为系统提示的文本。 */
   systemMessage?: string
+  /** 阻塞后续流程的错误信息。 */
   blockingError?: HookBlockingError
+  /** hook 执行结论。 */
   outcome: 'success' | 'blocking' | 'non_blocking_error' | 'cancelled'
+  /** 是否阻止后续对话或流程继续。 */
   preventContinuation?: boolean
+  /** 停止原因，通常来自 hook JSON 输出。 */
   stopReason?: string
+  /** hook 对权限请求的处理方式。 */
   permissionBehavior?: 'ask' | 'deny' | 'allow' | 'passthrough'
+  /** hook 给出的权限决策说明。 */
   hookPermissionDecisionReason?: string
+  /** hook 追加到上下文中的文本。 */
   additionalContext?: string
+  /** hook 修改后的首条用户消息。 */
   initialUserMessage?: string
+  /** hook 修改后的工具输入。 */
   updatedInput?: Record<string, unknown>
+  /** PostToolUse hook 修改后的 MCP 工具输出。 */
   updatedMCPToolOutput?: unknown
+  /** PermissionRequest hook 的结构化处理结果。 */
   permissionRequestResult?: PermissionRequestResult
+  /** Elicitation hook 的响应结果。 */
   elicitationResponse?: ElicitationResponse
+  /** FileChanged hook 需要继续观察的路径列表。 */
   watchPaths?: string[]
+  /** ElicitationResult hook 的响应结果。 */
   elicitationResultResponse?: ElicitationResponse
+  /** PermissionDenied hook 请求重试时使用。 */
   retry?: boolean
+  /** 产生该结果的 hook 定义。 */
   hook: HookCommand | HookCallback | FunctionHook
 }
 
+/**
+ * 多个 hook 结果聚合后的输出。
+ *
+ * 场景：异步生成器对外逐步产出 hook 消息、阻塞状态、权限行为和上下文更新。
+ */
 export type AggregatedHookResult = {
+  /** 需要展示给用户的附件消息。 */
   message?: HookResultMessage
+  /** 聚合后的阻塞错误。 */
   blockingError?: HookBlockingError
+  /** 是否阻止后续流程继续。 */
   preventContinuation?: boolean
+  /** 聚合后的停止原因。 */
   stopReason?: string
+  /** 权限决策说明。 */
   hookPermissionDecisionReason?: string
+  /** hook 来源，通常是 settings、plugin 或 skill。 */
   hookSource?: string
+  /** 聚合后的权限行为。 */
   permissionBehavior?: PermissionResult['behavior']
+  /** hook 追加的上下文集合。 */
   additionalContexts?: string[]
+  /** hook 修改后的首条用户消息。 */
   initialUserMessage?: string
+  /** hook 修改后的工具输入。 */
   updatedInput?: Record<string, unknown>
+  /** hook 修改后的 MCP 工具输出。 */
   updatedMCPToolOutput?: unknown
+  /** PermissionRequest hook 的结构化结果。 */
   permissionRequestResult?: PermissionRequestResult
+  /** 需要继续观察的文件路径列表。 */
   watchPaths?: string[]
+  /** Elicitation hook 的聚合响应。 */
   elicitationResponse?: ElicitationResponse
+  /** ElicitationResult hook 的聚合响应。 */
   elicitationResultResponse?: ElicitationResponse
+  /** 是否请求重试。 */
   retry?: boolean
 }
 
 /**
- * Parse and validate a JSON string against the hook output Zod schema.
- * Returns the validated output or formatted validation errors.
+ * 按 hook 输出 schema 解析并校验 JSON 字符串。
+ *
+ * @param jsonString hook 输出的 JSON 字符串。
+ * @returns 校验后的 JSON 输出，或格式化后的校验错误文本。
  */
 function validateHookJson(
   jsonString: string,
 ): { json: HookJSONOutput } | { validationError: string } {
+  // 1. 先用统一 JSON 解析器读取字符串，再交给 Zod schema 校验协议字段。
   const parsed = jsonParse(jsonString)
   const validation = hookJSONOutputSchema().safeParse(parsed)
   if (validation.success) {
     logForDebugging('Successfully parsed and validated hook JSON output')
     return { json: validation.data }
   }
+  // 2. 校验失败时把每个字段错误展开成可读文本，便于 hook 作者定位输出问题。
   const errors = validation.error.issues
     .map(err => `  - ${err.path.join('.')}: ${err.message}`)
     .join('\n')
@@ -396,23 +454,31 @@ function validateHookJson(
   }
 }
 
+/**
+ * 解析命令类 hook 的 stdout 输出。
+ *
+ * @param stdout hook 进程写到标准输出的完整文本。
+ * @returns JSON 协议输出、普通文本输出或 JSON 校验错误。
+ */
 function parseHookOutput(stdout: string): {
   json?: HookJSONOutput
   plainText?: string
   validationError?: string
 } {
   const trimmed = stdout.trim()
+  // 1. 非对象开头的输出按普通文本处理，保留原始 stdout。
   if (!trimmed.startsWith('{')) {
     logForDebugging('Hook output does not start with {, treating as plain text')
     return { plainText: stdout }
   }
 
   try {
+    // 2. 对 JSON 输出做协议校验；成功时直接返回结构化结果。
     const result = validateHookJson(trimmed)
     if ('json' in result) {
       return result
     }
-    // For command hooks, include the schema hint in the error message
+    // 3. 命令 hook 校验失败时追加期望 schema，帮助用户修正脚本输出。
     const errorMessage = `${result.validationError}\n\nExpected schema:\n${jsonStringify(
       {
         continue: 'boolean (optional)',
@@ -445,17 +511,25 @@ function parseHookOutput(stdout: string): {
     logForDebugging(errorMessage)
     return { plainText: stdout, validationError: errorMessage }
   } catch (e) {
+    // 4. JSON 解析异常不阻断流程，降级为普通文本输出。
     logForDebugging(`Failed to parse hook output as JSON: ${e}`)
     return { plainText: stdout }
   }
 }
 
+/**
+ * 解析 HTTP hook 的响应体。
+ *
+ * @param body HTTP hook 返回的响应体文本。
+ * @returns 合法 JSON 输出或校验错误；HTTP hook 不接受普通文本协议。
+ */
 function parseHttpHookOutput(body: string): {
   json?: HookJSONOutput
   validationError?: string
 } {
   const trimmed = body.trim()
 
+  // 1. 空响应体等价于空 JSON 对象，允许 HTTP hook 只表示成功。
   if (trimmed === '') {
     const validation = hookJSONOutputSchema().safeParse({})
     if (validation.success) {
@@ -466,6 +540,7 @@ function parseHttpHookOutput(body: string): {
     }
   }
 
+  // 2. HTTP hook 必须返回 JSON，非 JSON 响应直接作为协议错误。
   if (!trimmed.startsWith('{')) {
     const validationError = `HTTP hook must return JSON, but got non-JSON response body: ${trimmed.length > 200 ? trimmed.slice(0, 200) + '\u2026' : trimmed}`
     logForDebugging(validationError)
@@ -473,6 +548,7 @@ function parseHttpHookOutput(body: string): {
   }
 
   try {
+    // 3. 对 JSON 响应做统一 schema 校验。
     const result = validateHookJson(trimmed)
     if ('json' in result) {
       return result
@@ -480,12 +556,19 @@ function parseHttpHookOutput(body: string): {
     logForDebugging(result.validationError)
     return result
   } catch (e) {
+    // 4. JSON 解析失败时返回可展示的校验错误。
     const validationError = `HTTP hook must return valid JSON, but parsing failed: ${e}`
     logForDebugging(validationError)
     return { validationError }
   }
 }
 
+/**
+ * 把同步 hook 的 JSON 输出转换为内部 HookResult 字段。
+ *
+ * @param param0 hook JSON、命令信息、事件类型、输出和耗时等执行上下文。
+ * @returns 可合并进 HookResult 的局部结果。
+ */
 function processHookJSONOutput({
   json,
   command,
@@ -511,10 +594,10 @@ function processHookJSONOutput({
 }): Partial<HookResult> {
   const result: Partial<HookResult> = {}
 
-  // At this point we know it's a sync response
+  // 1. 进入本函数时已经确认这是同步响应。
   const syncJson = json
 
-  // Handle common elements
+  // 2. 处理通用控制字段，例如是否继续和停止原因。
   if (syncJson.continue === false) {
     result.preventContinuation = true
     if (syncJson.stopReason) {
@@ -522,6 +605,7 @@ function processHookJSONOutput({
     }
   }
 
+  // 3. 处理旧版 decision 字段，把 approve/block 映射为权限 allow/deny。
   if (json.decision) {
     switch (json.decision) {
       case 'approve':
@@ -535,19 +619,19 @@ function processHookJSONOutput({
         }
         break
       default:
-        // Handle unknown decision types as errors
+        // 4. 未知 decision 类型说明 hook 协议不合法，需要抛错暴露配置问题。
         throw new Error(
           `Unknown hook decision type: ${json.decision}. Valid types are: approve, block`,
         )
     }
   }
 
-  // Handle systemMessage field
+  // 5. 透传 hook 想注入的系统消息。
   if (json.systemMessage) {
     result.systemMessage = json.systemMessage
   }
 
-  // Handle PreToolUse specific
+  // 6. 处理 PreToolUse 专属的权限决策字段。
   if (
     json.hookSpecificOutput?.hookEventName === 'PreToolUse' &&
     json.hookSpecificOutput.permissionDecision
@@ -567,7 +651,7 @@ function processHookJSONOutput({
         result.permissionBehavior = 'ask'
         break
       default:
-        // Handle unknown decision types as errors
+        // 7. 未知 permissionDecision 类型同样视为协议错误。
         throw new Error(
           `Unknown hook permissionDecision type: ${json.hookSpecificOutput.permissionDecision}. Valid types are: allow, deny, ask`,
         )
@@ -577,9 +661,9 @@ function processHookJSONOutput({
     result.hookPermissionDecisionReason = json.reason
   }
 
-  // Handle hookSpecificOutput
+  // 8. 处理按事件细分的 hookSpecificOutput。
   if (json.hookSpecificOutput) {
-    // Validate hook event name matches expected if provided
+    // 9. 如果调用方声明了期望事件，hook 输出必须和该事件一致。
     if (
       expectedHookEvent &&
       json.hookSpecificOutput.hookEventName !== expectedHookEvent
@@ -591,7 +675,7 @@ function processHookJSONOutput({
 
     switch (json.hookSpecificOutput.hookEventName) {
       case 'PreToolUse':
-        // Override with more specific permission decision if provided
+        // 10. PreToolUse 可以用更具体的 permissionDecision 覆盖通用 decision。
         if (json.hookSpecificOutput.permissionDecision) {
           switch (json.hookSpecificOutput.permissionDecision) {
             case 'allow':
@@ -614,11 +698,11 @@ function processHookJSONOutput({
         }
         result.hookPermissionDecisionReason =
           json.hookSpecificOutput.permissionDecisionReason
-        // Extract updatedInput if provided
+        // 11. PreToolUse 可返回修改后的工具输入。
         if (json.hookSpecificOutput.updatedInput) {
           result.updatedInput = json.hookSpecificOutput.updatedInput
         }
-        // Extract additionalContext if provided
+        // 12. PreToolUse 还可以追加给后续模型可见的上下文。
         result.additionalContext = json.hookSpecificOutput.additionalContext
         break
       case 'UserPromptSubmit':
@@ -642,7 +726,7 @@ function processHookJSONOutput({
         break
       case 'PostToolUse':
         result.additionalContext = json.hookSpecificOutput.additionalContext
-        // Extract updatedMCPToolOutput if provided
+        // 13. PostToolUse 可以改写后续看到的 MCP 工具输出。
         if (json.hookSpecificOutput.updatedMCPToolOutput) {
           result.updatedMCPToolOutput =
             json.hookSpecificOutput.updatedMCPToolOutput
@@ -655,10 +739,9 @@ function processHookJSONOutput({
         result.retry = json.hookSpecificOutput.retry
         break
       case 'PermissionRequest':
-        // Extract the permission request decision
+        // 14. PermissionRequest 的决策会同时更新结构化结果和通用权限行为。
         if (json.hookSpecificOutput.decision) {
           result.permissionRequestResult = json.hookSpecificOutput.decision
-          // Also update permissionBehavior for consistency
           result.permissionBehavior =
             json.hookSpecificOutput.decision.behavior === 'allow'
               ? 'allow'
@@ -672,6 +755,7 @@ function processHookJSONOutput({
         }
         break
       case 'Elicitation':
+        // 15. Elicitation hook 可直接给出用户征询响应；decline 会转成阻塞结果。
         if (json.hookSpecificOutput.action) {
           result.elicitationResponse = {
             action: json.hookSpecificOutput.action,
@@ -688,6 +772,7 @@ function processHookJSONOutput({
         }
         break
       case 'ElicitationResult':
+        // 16. ElicitationResult hook 可审查征询结果；decline 会阻断继续处理。
         if (json.hookSpecificOutput.action) {
           result.elicitationResultResponse = {
             action: json.hookSpecificOutput.action,
@@ -707,6 +792,7 @@ function processHookJSONOutput({
     }
   }
 
+  // 17. 根据是否阻塞生成对应附件消息；成功 JSON 输出的正文留空，避免重复噪声。
   return {
     ...result,
     message: result.blockingError
@@ -722,10 +808,7 @@ function processHookJSONOutput({
           hookName,
           toolUseID,
           hookEvent,
-          // JSON-output hooks inject context via additionalContext →
-          // hook_additional_context, not this field. Empty content suppresses
-          // the trivial "X hook success: Success" system-reminder that
-          // otherwise pollutes every turn (messages.ts:3577 skips on '').
+          // 18. JSON 输出 hook 的上下文走 additionalContext；这里留空可避免无意义成功提示污染对话。
           content: '',
           stdout,
           stderr,
@@ -737,12 +820,21 @@ function processHookJSONOutput({
 }
 
 /**
- * Execute a command-based hook using bash or PowerShell.
+ * 使用 bash 或 PowerShell 执行命令型 hook。
  *
- * Shell resolution: hook.shell → 'bash'. PowerShell hooks spawn pwsh
- * with -NoProfile -NonInteractive -Command and skip bash-specific prep
- * (POSIX path conversion, .sh auto-prepend, CLAUDE_CODE_SHELL_PREFIX).
- * See docs/design/ps-shell-selection.md §5.1.
+ * @param hook 命令型 hook 配置。
+ * @param hookEvent 当前触发的 hook 事件，也可包含状态栏和文件建议这类特殊事件。
+ * @param hookName 用于日志、进度和展示的 hook 名称。
+ * @param jsonInput 序列化后的 hook 输入 JSON。
+ * @param signal 取消信号，用于中止进程。
+ * @param hookId 当前 hook 执行实例 ID。
+ * @param hookIndex 同一事件下的 hook 序号，可用于环境文件命名。
+ * @param pluginRoot 插件根目录；插件 hook 需要它做变量替换和环境变量。
+ * @param pluginId 插件标识；用于插件数据目录和用户配置读取。
+ * @param skillRoot 技能根目录；技能 hook 会复用插件根目录环境变量名。
+ * @param forceSyncExecution 是否强制等待异步 hook 完整结束。
+ * @param requestPrompt 可选交互回调，用于处理 hook 输出的 prompt 请求。
+ * @returns hook 进程的 stdout、stderr、合并输出、退出码和异步/取消状态。
  */
 async function execCommandHook(
   hook: HookCommand & { type: 'command' },
@@ -765,9 +857,7 @@ async function execCommandHook(
   aborted?: boolean
   backgrounded?: boolean
 }> {
-  // Gated to once-per-session events to keep diag_log volume bounded.
-  // started/completed live inside the try/finally so setup-path throws
-  // don't orphan a started marker — that'd be indistinguishable from a hang.
+  // 1. 只对单次会话级事件输出诊断日志，避免高频工具 hook 把日志打爆。
   const shouldEmitDiag =
     hookEvent === 'SessionStart' ||
     hookEvent === 'Setup' ||
@@ -778,69 +868,32 @@ async function execCommandHook(
 
   const isWindows = getPlatform() === 'windows'
 
-  // --
-  // Per-hook shell selection (phase 1 of docs/design/ps-shell-selection.md).
-  // Resolution order: hook.shell → DEFAULT_HOOK_SHELL. The defaultShell
-  // fallback (settings.defaultShell) is phase 2 — not wired yet.
-  //
-  // The bash path is the historical default and stays unchanged. The
-  // PowerShell path deliberately skips the Windows-specific bash
-  // accommodations (cygpath conversion, .sh auto-prepend, POSIX-quoted
-  // SHELL_PREFIX).
+  // 2. 按 hook.shell 选择 shell；未声明时使用默认 shell，保持历史 bash 行为。
   const shellType = hook.shell ?? DEFAULT_HOOK_SHELL
 
   const isPowerShell = shellType === 'powershell'
 
-  // --
-  // Windows bash path: hooks run via Git Bash (Cygwin), NOT cmd.exe.
-  //
-  // This means every path we put into env vars or substitute into the command
-  // string MUST be a POSIX path (/c/Users/foo), not a Windows path
-  // (C:\Users\foo or C:/Users/foo). Git Bash cannot resolve Windows paths.
-  //
-  // windowsPathToPosixPath() is pure-JS regex conversion (no cygpath shell-out):
-  // C:\Users\foo -> /c/Users/foo, UNC preserved, slashes flipped. Memoized
-  // (LRU-500) so repeated calls are cheap.
-  //
-  // PowerShell path: use native paths — skip the conversion entirely.
-  // PowerShell expects Windows paths on Windows (and native paths on
-  // Unix where pwsh is also available).
+  // 3. Windows bash 使用 Git Bash，需要 POSIX 路径；PowerShell 使用平台原生路径。
   const toHookPath =
     isWindows && !isPowerShell
       ? (p: string) => windowsPathToPosixPath(p)
       : (p: string) => p
 
-  // Set CLAUDE_PROJECT_DIR to the stable project root (not the worktree path).
-  // getProjectRoot() is never updated when entering a worktree, so hooks that
-  // reference $CLAUDE_PROJECT_DIR always resolve relative to the real repo root.
+  // 4. CLAUDE_PROJECT_DIR 固定指向项目根目录，避免 worktree cwd 变化影响 hook 定位。
   const projectDir = getProjectRoot()
 
-  // Substitute ${CLAUDE_PLUGIN_ROOT} and ${user_config.X} in the command string.
-  // Order matches MCP/LSP (plugin vars FIRST, then user config) so a user-
-  // entered value containing the literal text ${CLAUDE_PLUGIN_ROOT} is treated
-  // as opaque — not re-interpreted as a template.
+  // 5. 先替换插件目录变量，再替换用户配置变量，避免用户配置值被二次当成模板解释。
   let command = hook.command
   let pluginOpts: ReturnType<typeof loadPluginOptions> | undefined
   if (pluginRoot) {
-    // Plugin directory gone (orphan GC race, concurrent session deleted it):
-    // throw so callers yield a non-blocking error. Running would fail — and
-    // `python3 <missing>.py` exits 2, the hook protocol's "block" code, which
-    // bricks UserPromptSubmit/Stop until restart. The pre-check is necessary
-    // because exit-2-from-missing-script is indistinguishable from an
-    // intentional block after spawn.
+    // 6. 插件目录缺失时提前失败，否则脚本找不到也可能返回协议阻塞码 2，和真实阻塞无法区分。
     if (!(await pathExists(pluginRoot))) {
       throw new Error(
         `Plugin directory does not exist: ${pluginRoot}` +
           (pluginId ? ` (${pluginId} — run /plugin to reinstall)` : ''),
       )
     }
-    // Inline both ROOT and DATA substitution instead of calling
-    // substitutePluginVariables(). That helper normalizes \ → / on Windows
-    // unconditionally — correct for bash (toHookPath already produced /c/...
-    // so it's a no-op) but wrong for PS where toHookPath is identity and we
-    // want native C:\... backslashes. Inlining also lets us use the function-
-    // form .replace() so paths containing $ aren't mangled by $-pattern
-    // interpretation (rare but possible: \\server\c$\plugin).
+    // 7. 内联替换插件根目录和数据目录，确保 bash/PowerShell 各自拿到正确路径格式。
     const rootPath = toHookPath(pluginRoot)
     command = command.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, () => rootPath)
     if (pluginId) {
@@ -849,26 +902,19 @@ async function execCommandHook(
     }
     if (pluginId) {
       pluginOpts = loadPluginOptions(pluginId)
-      // Throws if a referenced key is missing — that means the hook uses a key
-      // that's either not declared in manifest.userConfig or not yet configured.
-      // Caught upstream like any other hook exec failure.
+      // 8. 用户配置缺失会抛错，由上层按 hook 执行失败统一处理。
       command = substituteUserConfigVariables(command, pluginOpts)
     }
   }
 
-  // On Windows (bash only), auto-prepend `bash` for .sh scripts so they
-  // execute instead of opening in the default file handler. PowerShell
-  // runs .ps1 files natively — no prepend needed.
+  // 9. Windows bash 路径下自动给 .sh 命令补 bash，避免系统用默认文件处理器打开脚本。
   if (isWindows && !isPowerShell && command.trim().match(/\.sh(\s|$|")/)) {
     if (!command.trim().startsWith('bash ')) {
       command = `bash ${command}`
     }
   }
 
-  // CLAUDE_CODE_SHELL_PREFIX wraps the command via POSIX quoting
-  // (formatShellPrefixCommand uses shell-quote). This makes no sense for
-  // PowerShell — see design §8.1. For now PS hooks ignore the prefix;
-  // a CLAUDE_CODE_PS_SHELL_PREFIX (or shell-aware prefix) is a follow-up.
+  // 10. bash hook 支持 CLAUDE_CODE_SHELL_PREFIX；PowerShell 不使用 POSIX 前缀包装。
   const finalCommand =
     !isPowerShell && process.env.CLAUDE_CODE_SHELL_PREFIX
       ? formatShellPrefixCommand(process.env.CLAUDE_CODE_SHELL_PREFIX, command)
@@ -878,28 +924,23 @@ async function execCommandHook(
     ? hook.timeout * 1000
     : TOOL_HOOK_EXECUTION_TIMEOUT_MS
 
-  // Build env vars — all paths go through toHookPath for Windows POSIX conversion
+  // 11. 构造子进程环境变量；所有路径按 shell 类型转换。
   const envVars: NodeJS.ProcessEnv = {
     ...subprocessEnv(),
     CLAUDE_PROJECT_DIR: toHookPath(projectDir),
   }
 
-  // Plugin and skill hooks both set CLAUDE_PLUGIN_ROOT (skills use the same
-  // name for consistency — skills can migrate to plugins without code changes)
+  // 12. 插件和技能 hook 都暴露 CLAUDE_PLUGIN_ROOT，便于技能未来迁移成插件。
   if (pluginRoot) {
     envVars.CLAUDE_PLUGIN_ROOT = toHookPath(pluginRoot)
     if (pluginId) {
       envVars.CLAUDE_PLUGIN_DATA = toHookPath(getPluginDataDir(pluginId))
     }
   }
-  // Expose plugin options as env vars too, so hooks can read them without
-  // ${user_config.X} in the command string. Sensitive values included — hooks
-  // run the user's own code, same trust boundary as reading keychain directly.
+  // 13. 插件配置也写入环境变量，hook 可不经命令模板直接读取配置值。
   if (pluginOpts) {
     for (const [key, value] of Object.entries(pluginOpts)) {
-      // Sanitize non-identifier chars (bash can't ref $FOO-BAR). The schema
-      // at schemas.ts:611 now constrains keys to /^[A-Za-z_]\w*$/ so this is
-      // belt-and-suspenders, but cheap insurance if someone bypasses the schema.
+      // 14. 环境变量名只保留标识符字符，防御绕过 schema 的异常 key。
       const envKey = key.replace(/[^A-Za-z0-9_]/g, '_').toUpperCase()
       envVars[`CLAUDE_PLUGIN_OPTION_${envKey}`] = String(value)
     }
@@ -908,12 +949,7 @@ async function execCommandHook(
     envVars.CLAUDE_PLUGIN_ROOT = toHookPath(skillRoot)
   }
 
-  // CLAUDE_ENV_FILE points to a .sh file that the hook writes env var
-  // definitions into; getSessionEnvironmentScript() concatenates them and
-  // bashProvider injects the content into bash commands. A PS hook would
-  // naturally write PS syntax ($env:FOO = 'bar'), which bash can't parse.
-  // Skip for PS — consistent with how .sh prepend and SHELL_PREFIX are
-  // already bash-only above.
+  // 15. bash hook 可通过 CLAUDE_ENV_FILE 持久化环境变量；PowerShell 语法不同，所以跳过。
   if (
     !isPowerShell &&
     (hookEvent === 'SessionStart' ||
@@ -925,9 +961,7 @@ async function execCommandHook(
     envVars.CLAUDE_ENV_FILE = await getHookEnvFilePath(hookEvent, hookIndex)
   }
 
-  // When agent worktrees are removed, getCwd() may return a deleted path via
-  // AsyncLocalStorage. Validate before spawning since spawn() emits async
-  // 'error' events for missing cwd rather than throwing synchronously.
+  // 16. 启动进程前确认 cwd 仍存在；已删除 worktree 会回退到原始工作目录。
   const hookCwd = getCwd()
   const safeCwd = (await pathExists(hookCwd)) ? hookCwd : getOriginalCwd()
   if (safeCwd !== hookCwd) {
@@ -937,23 +971,7 @@ async function execCommandHook(
     )
   }
 
-  // --
-  // Spawn. Two completely separate paths:
-  //
-  //   Bash: spawn(cmd, [], { shell: <gitBashPath | true> }) — the shell
-  //   option makes Node pass the whole string to the shell for parsing.
-  //
-  //   PowerShell: spawn(pwshPath, ['-NoProfile', '-NonInteractive',
-  //   '-Command', cmd]) — explicit argv, no shell option. -NoProfile
-  //   skips user profile scripts (faster, deterministic).
-  //   -NonInteractive fails fast instead of prompting.
-  //
-  // The Git Bash hard-exit in findGitBashPath() is still in place for
-  // bash hooks. PowerShell hooks never call it, so a Windows user with
-  // only pwsh and shell: 'powershell' on every hook could in theory run
-  // without Git Bash — but init.ts still calls setShellIfWindows() on
-  // startup, which will exit first. Relaxing that is phase 1 of the
-  // design's implementation order (separate PR).
+  // 17. 按 shell 类型启动进程：PowerShell 使用显式 argv，bash 交给 shell 解析整条命令。
   let child: ChildProcessWithoutNullStreams
   if (shellType === 'powershell') {
     const pwshPath = await getCachedPowerShellPath()
@@ -967,29 +985,27 @@ async function execCommandHook(
     child = spawn(pwshPath, buildPowerShellArgs(finalCommand), {
       env: envVars,
       cwd: safeCwd,
-      // Prevent visible console window on Windows (no-op on other platforms)
+      // 18. Windows 下隐藏控制台窗口，其他平台该参数无影响。
       windowsHide: true,
     }) as ChildProcessWithoutNullStreams
   } else {
-    // On Windows, use Git Bash explicitly (cmd.exe can't run bash syntax).
-    // On other platforms, shell: true uses /bin/sh.
+    // 19. Windows 明确使用 Git Bash；其他平台让 Node 使用默认 /bin/sh。
     const shell = isWindows ? findGitBashPath() : true
     child = spawn(finalCommand, [], {
       env: envVars,
       cwd: safeCwd,
       shell,
-      // Prevent visible console window on Windows (no-op on other platforms)
+      // 20. Windows 下隐藏控制台窗口，避免 hook 执行弹出黑框。
       windowsHide: true,
     }) as ChildProcessWithoutNullStreams
   }
 
-  // Hooks use pipe mode — stdout must be streamed into JS so we can parse
-  // the first response line to detect async hooks ({"async": true}).
+  // 21. hook 使用 pipe 模式，把 stdout 流入 JS 才能识别首行异步协议。
   const hookTaskOutput = new TaskOutput(`hook_${child.pid}`, null)
   const shellCommand = wrapSpawn(child, signal, hookTimeoutMs, hookTaskOutput)
-  // Track whether shellCommand ownership was transferred (e.g., to async hook registry)
+  // 22. 标记 ShellCommand 是否已交给异步注册表，避免 finally 中重复清理。
   let shellCommandTransferred = false
-  // Track whether stdin has already been written (to avoid "write after end" errors)
+  // 23. 标记 stdin 是否已经写入，避免后续重复写导致 write after end。
   let stdinWritten = false
 
   if ((hook.async || hook.asyncRewake) && !forceSyncExecution) {
@@ -998,11 +1014,7 @@ async function execCommandHook(
       `Hooks: Config-based async hook, backgrounding process ${processId}`,
     )
 
-    // Write stdin before backgrounding so the hook receives its input.
-    // The trailing newline matches the sync path (L1000). Without it,
-    // bash `read -r line` returns exit 1 (EOF before delimiter) — the
-    // variable IS populated but `if read -r line; then ...` skips the
-    // branch. See gh-30509 / CC-161.
+    // 24. 进入后台前先写入 JSON 输入，并追加换行以兼容 bash read 的行读取语义。
     child.stdin.write(jsonInput + '\n', 'utf8')
     child.stdin.end()
     stdinWritten = true
@@ -1033,7 +1045,7 @@ async function execCommandHook(
   let stderr = ''
   let output = ''
 
-  // Set up output data collection with explicit UTF-8 encoding
+  // 25. 显式按 UTF-8 读取输出，保证多语言文本和 JSON 内容稳定。
   child.stdout.setEncoding('utf8')
   child.stderr.setEncoding('utf8')
 
@@ -1057,23 +1069,22 @@ async function execCommandHook(
     asyncResolve = resolve
   })
 
-  // Track trimmed prompt-request lines we processed so we can strip them
-  // from final stdout by content match (no index tracking → no index drift)
+  // 26. 记录已处理的 prompt 请求行，后续从最终 stdout 中剔除，避免协议行泄露给普通解析。
   const processedPromptLines = new Set<string>()
-  // Serialize async prompt handling so responses are sent in order
+  // 27. 串行化 prompt 响应，保证 hook 收到的回答顺序和请求顺序一致。
   let promptChain = Promise.resolve()
-  // Line buffer for detecting prompt requests in streaming output
+  // 28. 维护行缓冲区，用于从流式 stdout 中识别完整 JSON 请求行。
   let lineBuffer = ''
 
   child.stdout.on('data', data => {
     stdout += data
     output += data
 
-    // When requestPrompt is provided, parse stdout line-by-line for prompt requests
+    // 29. 如果提供交互回调，就逐行解析 stdout 中的 prompt 请求。
     if (requestPrompt) {
       lineBuffer += data
       const lines = lineBuffer.split('\n')
-      lineBuffer = lines.pop() ?? '' // last element is an incomplete line
+      lineBuffer = lines.pop() ?? '' // 30. 最后一段可能是不完整行，留到下一次 data 事件继续拼接。
 
       for (const line of lines) {
         const trimmed = line.trim()
@@ -1087,7 +1098,7 @@ async function execCommandHook(
             logForDebugging(
               `Hooks: Detected prompt request from hook: ${trimmed}`,
             )
-            // Chain the async handling to serialize prompt responses
+            // 31. 将 prompt 响应接到 promise 链上，避免并发写 stdin。
             const promptReq = validation.data
             const reqPrompt = requestPrompt
             promptChain = promptChain.then(async () => {
@@ -1096,24 +1107,19 @@ async function execCommandHook(
                 child.stdin.write(jsonStringify(response) + '\n', 'utf8')
               } catch (err) {
                 logForDebugging(`Hooks: Prompt request handling failed: ${err}`)
-                // User cancelled or prompt failed — close stdin so the hook
-                // process doesn't hang waiting for input
+                // 32. 用户取消或 prompt 失败时关闭 stdin，避免 hook 一直等待输入。
                 child.stdin.destroy()
               }
             })
             continue
           }
         } catch {
-          // Not JSON, just a normal line
+          // 33. 非 JSON 行只是普通输出，继续等待后续内容。
         }
       }
     }
 
-    // Check for async response on first line of output. The async protocol is:
-    // hook emits {"async":true,...} as its FIRST line, then its normal output.
-    // We must parse ONLY the first line — if the process is fast and writes more
-    // before this 'data' event fires, parsing the full accumulated stdout fails
-    // and an async hook blocks for its full duration instead of backgrounding.
+    // 34. 只解析首行异步协议；如果把后续普通输出一起解析，会导致快速进程无法正确后台化。
     if (!initialResponseChecked) {
       const firstLine = firstLineOf(stdout).trim()
       if (!firstLine.includes('}')) return
@@ -1176,8 +1182,7 @@ async function execCommandHook(
     getOutput: async () => ({ stdout, stderr, output }),
   })
 
-  // Wait for stdout and stderr streams to finish before considering output complete
-  // This prevents a race condition where 'close' fires before all 'data' events are processed
+  // 35. 等 stdout/stderr 流真正结束，避免 close 先到导致输出不完整。
   const stdoutEndPromise = new Promise<void>(resolve => {
     child.stdout.on('end', () => resolve())
   })
@@ -1186,18 +1191,12 @@ async function execCommandHook(
     child.stderr.on('end', () => resolve())
   })
 
-  // Write to stdin, making sure to handle EPIPE errors that can happen when
-  // the hook command exits before reading all input.
-  // Note: EPIPE handling is difficult to set up in testing since Bun and Node
-  // have different behaviors.
-  // TODO: Add tests for EPIPE handling.
-  // Skip if stdin was already written (e.g., by config-based async hook path)
+  // 36. 写入 hook 输入时处理 EPIPE；配置型异步 hook 已写过 stdin 时直接跳过。
   const stdinWritePromise = stdinWritten
     ? Promise.resolve()
     : new Promise<void>((resolve, reject) => {
         child.stdin.on('error', err => {
-          // When requestPrompt is provided, stdin stays open for prompt responses.
-          // EPIPE errors from later writes (after process exits) are expected -- suppress them.
+          // 37. prompt 流程中 stdin 会保持打开，进程提前退出后的 EPIPE 属于预期噪声。
           if (!requestPrompt) {
             reject(err)
           } else {
@@ -1206,22 +1205,21 @@ async function execCommandHook(
             )
           }
         })
-        // Explicitly specify UTF-8 encoding to ensure proper handling of Unicode characters
+        // 38. 明确使用 UTF-8 写入 JSON 输入，避免 Unicode 内容被错误编码。
         child.stdin.write(jsonInput + '\n', 'utf8')
-        // When requestPrompt is provided, keep stdin open for prompt responses
+        // 39. 没有交互 prompt 时立即关闭 stdin；有 prompt 时继续等待后续回答。
         if (!requestPrompt) {
           child.stdin.end()
         }
         resolve()
       })
 
-  // Create promise for child process error
+  // 40. 子进程 error 事件单独建 promise，参与后面的竞速等待。
   const childErrorPromise = new Promise<never>((_, reject) => {
     child.on('error', reject)
   })
 
-  // Create promise for child process close - but only resolve after streams end
-  // to ensure all output has been collected
+  // 41. close 事件到达后仍等待输出流结束，再解析最终 stdout/stderr。
   const childClosePromise = new Promise<{
     stdout: string
     stderr: string
@@ -1234,12 +1232,9 @@ async function execCommandHook(
     child.on('close', code => {
       exitCode = code ?? 1
 
-      // Wait for both streams to end before resolving with the final output
+      // 42. stdout/stderr 都结束后才形成最终结果。
       void Promise.all([stdoutEndPromise, stderrEndPromise]).then(() => {
-        // Strip lines we processed as prompt requests so parseHookOutput
-        // only sees the final hook result. Content-matching against the set
-        // of actually-processed lines means prompt JSON can never leak
-        // through (fail-closed), regardless of line positioning.
+        // 43. 剔除已消费的 prompt 请求行，让后续 hook 输出解析只看到真正结果。
         const finalStdout =
           processedPromptLines.size === 0
             ? stdout
@@ -1259,7 +1254,7 @@ async function execCommandHook(
     })
   })
 
-  // Race between stdin write, async detection, and process completion
+  // 44. 在输入写入、异步识别和进程完成之间竞速，谁先决定结果就先返回。
   try {
     if (shouldEmitDiag) {
       logForDiagnosticsNoPII('info', 'hook_spawn_started', {
@@ -1269,19 +1264,19 @@ async function execCommandHook(
     }
     await Promise.race([stdinWritePromise, childErrorPromise])
 
-    // Wait for any pending prompt responses before resolving
+    // 45. 等待异步协议、进程关闭或进程错误中的任一结果。
     const result = await Promise.race([
       childIsAsyncPromise,
       childClosePromise,
       childErrorPromise,
     ])
-    // Ensure all queued prompt responses have been sent
+    // 46. 返回前确保所有排队的 prompt 响应都已写出。
     await promptChain
     diagExitCode = result.status
     diagAborted = result.aborted ?? false
     return result
   } catch (error) {
-    // Handle errors from stdin write or child process
+    // 47. 统一处理 stdin 写入或子进程启动/运行错误。
     const code = getErrnoCode(error)
     diagExitCode = 1
 
@@ -1327,7 +1322,7 @@ async function execCommandHook(
       })
     }
     stopProgressInterval()
-    // Clean up stream resources unless ownership was transferred (e.g., to async hook registry)
+    // 48. 未转交给异步注册表时，当前函数负责释放流资源。
     if (!shellCommandTransferred) {
       shellCommand.cleanup()
     }
@@ -1335,38 +1330,36 @@ async function execCommandHook(
 }
 
 /**
- * Check if a match query matches a hook matcher pattern
- * @param matchQuery The query to match (e.g., 'Write', 'Edit', 'Bash')
- * @param matcher The matcher pattern - can be:
- *   - Simple string for exact match (e.g., 'Write')
- *   - Pipe-separated list for multiple exact matches (e.g., 'Write|Edit')
- *   - Regex pattern (e.g., '^Write.*', '.*', '^(Write|Edit)$')
- * @returns true if the query matches the pattern
+ * 判断 hook 匹配器是否命中当前查询值。
+ *
+ * @param matchQuery 当前事件提取出的匹配值，例如工具名或事件来源。
+ * @param matcher hook 配置中的匹配模式；支持精确值、竖线分隔的多值和正则表达式。
+ * @returns true 表示命中该匹配器；false 表示不命中或正则无效。
  */
 function matchesPattern(matchQuery: string, matcher: string): boolean {
   if (!matcher || matcher === '*') {
     return true
   }
-  // Check if it's a simple string or pipe-separated list (no regex special chars except |)
+  // 1. 没有正则特殊字符时，按简单字符串或竖线分隔列表处理。
   if (/^[a-zA-Z0-9_|]+$/.test(matcher)) {
-    // Handle pipe-separated exact matches
+    // 2. 竖线分隔表示多个精确匹配值。
     if (matcher.includes('|')) {
       const patterns = matcher
         .split('|')
         .map(p => normalizeLegacyToolName(p.trim()))
       return patterns.includes(matchQuery)
     }
-    // Simple exact match
+    // 3. 单个值直接和规范化后的工具名比较。
     return matchQuery === normalizeLegacyToolName(matcher)
   }
 
-  // Otherwise treat as regex
+  // 4. 其他模式按正则表达式处理。
   try {
     const regex = new RegExp(matcher)
     if (regex.test(matchQuery)) {
       return true
     }
-    // Also test against legacy names so patterns like "^Task$" still match
+    // 5. 兼容旧工具名，让旧正则仍能匹配到新工具名对应的别名。
     for (const legacyName of getLegacyToolNames(matchQuery)) {
       if (regex.test(legacyName)) {
         return true
@@ -1374,23 +1367,31 @@ function matchesPattern(matchQuery: string, matcher: string): boolean {
     }
     return false
   } catch {
-    // If the regex is invalid, log error and return false
+    // 6. 正则无效时记录诊断并当作不匹配。
     logForDebugging(`Invalid regex pattern in hook matcher: ${matcher}`)
     return false
   }
 }
 
+/**
+ * hook if 条件的匹配函数类型。
+ *
+ * 场景：预先准备好工具输入和权限匹配器后，对每个 hook 的 if 表达式做快速判断。
+ */
 type IfConditionMatcher = (ifCondition: string) => boolean
 
 /**
- * Prepare a matcher for hook `if` conditions. Expensive work (tool lookup,
- * Zod validation, tree-sitter parsing for Bash) happens once here; the
- * returned closure is called per hook. Returns undefined for non-tool events.
+ * 准备 hook if 条件匹配器。
+ *
+ * @param hookInput 当前 hook 输入。
+ * @param tools 当前可用工具集合；工具事件会用它校验工具输入并构造权限匹配器。
+ * @returns 可复用的 if 条件匹配函数；非工具事件返回 undefined。
  */
 async function prepareIfConditionMatcher(
   hookInput: HookInput,
   tools: Tools | undefined,
 ): Promise<IfConditionMatcher | undefined> {
+  // 1. 只有带工具名和工具输入的事件才支持 if 条件匹配。
   if (
     hookInput.hook_event_name !== 'PreToolUse' &&
     hookInput.hook_event_name !== 'PostToolUse' &&
@@ -1400,6 +1401,7 @@ async function prepareIfConditionMatcher(
     return undefined
   }
 
+  // 2. 提前解析工具输入并构造路径/规则匹配器，避免每个 hook 重复做昂贵工作。
   const toolName = normalizeLegacyToolName(hookInput.tool_name)
   const tool = tools && findToolByName(tools, hookInput.tool_name)
   const input = tool?.inputSchema.safeParse(hookInput.tool_input)
@@ -1409,6 +1411,7 @@ async function prepareIfConditionMatcher(
       : undefined
 
   return ifCondition => {
+    // 3. if 条件中的工具名必须和当前事件工具一致。
     const parsed = permissionRuleValueFromString(ifCondition)
     if (normalizeLegacyToolName(parsed.toolName) !== toolName) {
       return false
@@ -1416,18 +1419,25 @@ async function prepareIfConditionMatcher(
     if (!parsed.ruleContent) {
       return true
     }
+    // 4. 带规则内容时，交给工具自己的权限匹配器判断。
     return patternMatcher ? patternMatcher(parsed.ruleContent) : false
   }
 }
 
+/**
+ * function hook 的匹配器结构。
+ *
+ * 场景：会话内注册的函数型 hook 不能持久化成普通 HookMatcher，需要单独保存回调数组。
+ */
 type FunctionHookMatcher = {
   matcher: string
   hooks: FunctionHook[]
 }
 
 /**
- * A hook paired with optional plugin context.
- * Used when returning matched hooks so we can apply plugin env vars at execution time.
+ * 附带来源上下文的匹配后 hook。
+ *
+ * 场景：执行插件或技能 hook 时，需要保留根目录、插件 ID 和来源名称来注入环境变量和日志。
  */
 type MatchedHook = {
   hook: HookCommand | HookCallback | FunctionHook
@@ -1437,26 +1447,32 @@ type MatchedHook = {
   hookSource?: string
 }
 
+/**
+ * 判断匹配结果是否为内部 callback hook。
+ *
+ * @param matched 已匹配的 hook 及来源上下文。
+ * @returns true 表示该 hook 是内部 callback，可走更快路径。
+ */
 function isInternalHook(matched: MatchedHook): boolean {
   return matched.hook.type === 'callback' && matched.hook.internal === true
 }
 
 /**
- * Build a dedup key for a matched hook, namespaced by source context.
+ * 构造带来源命名空间的 hook 去重键。
  *
- * Settings-file hooks (no pluginRoot/skillRoot) share the '' prefix so the
- * same command defined in user/project/local still collapses to one — the
- * original intent of the dedup. Plugin/skill hooks get their root as the
- * prefix, so two plugins sharing an unexpanded `${CLAUDE_PLUGIN_ROOT}/hook.sh`
- * template don't collapse: after expansion they point to different files.
+ * @param m 已匹配的 hook 及来源上下文。
+ * @param payload 参与去重的 hook 内容，例如命令、URL 或 prompt。
+ * @returns 可放入 Map 的去重键。
  */
 function hookDedupKey(m: MatchedHook, payload: string): string {
   return `${m.pluginRoot ?? m.skillRoot ?? ''}\0${payload}`
 }
 
 /**
- * Build a map of {sanitizedPluginName: hookCount} from matched hooks.
- * Only logs actual names for official marketplace plugins; others become 'third-party'.
+ * 统计匹配 hook 中各插件的 hook 数量。
+ *
+ * @param hooks 已匹配的 hook 列表。
+ * @returns 插件名到 hook 数量的映射；非官方插件统一归为 third-party。
  */
 function getPluginHookCounts(
   hooks: MatchedHook[],
@@ -1479,7 +1495,10 @@ function getPluginHookCounts(
 
 
 /**
- * Build a map of {hookType: count} from matched hooks.
+ * 统计匹配 hook 中各 hook 类型的数量。
+ *
+ * @param hooks 已匹配的 hook 列表。
+ * @returns hook 类型到数量的映射。
  */
 function getHookTypeCounts(hooks: MatchedHook[]): Record<string, number> {
   const counts: Record<string, number> = {}
@@ -1489,6 +1508,14 @@ function getHookTypeCounts(hooks: MatchedHook[]): Record<string, number> {
   return counts
 }
 
+/**
+ * 汇总指定事件可用的 hook 配置。
+ *
+ * @param appState 当前应用状态；为空时只读取快照和全局注册 hook。
+ * @param sessionId 当前会话或代理 ID。
+ * @param hookEvent 要查询的 hook 事件。
+ * @returns 来自设置快照、注册表和会话态的 hook 匹配器列表。
+ */
 function getHooksConfig(
   appState: AppState | undefined,
   sessionId: string,
@@ -1501,8 +1528,7 @@ function getHooksConfig(
   | SkillHookMatcher
   | SessionDerivedHookMatcher
 > {
-  // HookMatcher is a zod-stripped {matcher, hooks} so snapshot matchers can be
-  // pushed directly without re-wrapping.
+  // 1. 快照里的 HookMatcher 已经是可执行结构，可以直接作为基础列表。
   const hooks: Array<
     | HookMatcher
     | HookCallbackMatcher
@@ -1512,15 +1538,14 @@ function getHooksConfig(
     | SessionDerivedHookMatcher
   > = [...(getHooksConfigFromSnapshot()?.[hookEvent] ?? [])]
 
-  // Check if only managed hooks should run (used for both registered and session hooks)
+  // 2. 企业托管策略可能要求只运行托管 hook。
   const managedOnly = shouldAllowManagedHooksOnly()
 
-  // Process registered hooks (SDK callbacks and plugin native hooks)
+  // 3. 合并 SDK callback 和插件原生注册的 hook。
   const registeredHooks = getRegisteredHooks()?.[hookEvent]
   if (registeredHooks) {
     for (const matcher of registeredHooks) {
-      // Skip plugin hooks when restricted to managed hooks only
-      // Plugin hooks have pluginRoot set, SDK callbacks do not
+      // 4. 托管模式下跳过插件 hook，但保留 SDK callback。
       if (managedOnly && 'pluginRoot' in matcher) {
         continue
       }
@@ -1528,28 +1553,20 @@ function getHooksConfig(
     }
   }
 
-  // Merge session hooks for the current session only
-  // Function hooks (like structured output enforcement) must be scoped to their session
-  // to prevent hooks from one agent leaking to another (e.g., verification agent to main agent)
-  // Skip session hooks entirely when allowManagedHooksOnly is set —
-  // this prevents frontmatter hooks from agents/skills from bypassing the policy.
-  // strictPluginOnlyCustomization does NOT block here — it gates at the
-  // REGISTRATION sites (runAgent.ts:526 for agent frontmatter hooks) where
-  // agentDefinition.source is known. A blanket block here would also kill
-  // plugin-provided agents' frontmatter hooks, which is too broad.
-  // Also skip if appState not provided (for backwards compatibility)
+  // 5. 合并当前会话自己的 hook，避免一个代理注册的 hook 泄漏到另一个代理。
+  // 6. 托管模式或缺少 appState 时跳过会话 hook，防止 frontmatter hook 绕过策略。
   if (!managedOnly && appState !== undefined) {
     const sessionHooks = getSessionHooks(appState, sessionId, hookEvent).get(
       hookEvent,
     )
     if (sessionHooks) {
-      // SessionDerivedHookMatcher already includes optional skillRoot
+      // 7. SessionDerivedHookMatcher 已携带可选 skillRoot，可直接加入执行列表。
       for (const matcher of sessionHooks) {
         hooks.push(matcher)
       }
     }
 
-    // Merge session function hooks separately (can't be persisted to HookMatcher format)
+    // 8. function hook 带闭包回调，不能持久化成普通 HookMatcher，需要单独合并。
     const sessionFunctionHooks = getSessionFunctionHooks(
       appState,
       sessionId,
@@ -1566,24 +1583,19 @@ function getHooksConfig(
 }
 
 /**
- * Lightweight existence check for hooks on a given event. Mirrors the sources
- * assembled by getHooksConfig() but stops at the first hit without building
- * the full merged config.
+ * 快速判断指定事件是否可能存在 hook。
  *
- * Intentionally over-approximates: returns true if any matcher exists for the
- * event, even if managed-only filtering or pattern matching would later
- * discard it. A false positive just means we proceed to the full matching
- * path; a false negative would skip a hook, so we err on the side of true.
- *
- * Used to skip createBaseHookInput (getTranscriptPathForSession path joins)
- * and getMatchingHooks on hot paths where hooks are typically unconfigured.
- * See hasInstructionsLoadedHook / hasWorktreeCreateHook for the same pattern.
+ * @param hookEvent 要检查的 hook 事件。
+ * @param appState 当前应用状态；为空时不检查会话态 hook。
+ * @param sessionId 当前会话或代理 ID。
+ * @returns true 表示可能存在 hook；false 表示可以安全跳过后续匹配。
  */
 function hasHookForEvent(
   hookEvent: HookEvent,
   appState: AppState | undefined,
   sessionId: string,
 ): boolean {
+  // 1. 只做轻量存在性检查，宁可误报 true，也不能误报 false 跳过 hook。
   const snap = getHooksConfigFromSnapshot()?.[hookEvent]
   if (snap && snap.length > 0) return true
   const reg = getRegisteredHooks()?.[hookEvent]
@@ -1593,12 +1605,14 @@ function hasHookForEvent(
 }
 
 /**
- * Get hook commands that match the given query
- * @param appState The current app state (optional for backwards compatibility)
- * @param sessionId The current session ID (main session or agent ID)
- * @param hookEvent The hook event
- * @param hookInput The hook input for matching
- * @returns Array of matched hooks with optional plugin context
+ * 获取与当前 hook 输入匹配的 hook 列表。
+ *
+ * @param appState 当前应用状态；为空时只匹配非会话态 hook。
+ * @param sessionId 当前主会话 ID 或代理 ID。
+ * @param hookEvent 当前 hook 事件。
+ * @param hookInput 用于提取匹配查询值和 if 条件的 hook 输入。
+ * @param tools 当前可用工具集合；工具事件的 if 条件会用它做输入校验。
+ * @returns 附带插件或技能上下文的匹配 hook 列表。
  */
 export async function getMatchingHooks(
   appState: AppState | undefined,
@@ -1610,8 +1624,7 @@ export async function getMatchingHooks(
   try {
     const hookMatchers = getHooksConfig(appState, sessionId, hookEvent)
 
-    // If you change the criteria below, then you must change
-    // src/utils/hooks/hooksConfigManager.ts as well.
+    // 1. 根据事件类型提取匹配查询值；这里的规则需要和 hooksConfigManager 保持一致。
     let matchQuery: string | undefined = undefined
     switch (hookInput.hook_event_name) {
       case 'PreToolUse':
@@ -1677,7 +1690,7 @@ export async function getMatchingHooks(
       level: 'verbose',
     })
 
-    // Extract hooks with their plugin context (if any)
+    // 2. 先按 matcher 过滤，再保留插件/技能来源上下文。
     const filteredMatchers = matchQuery
       ? hookMatchers.filter(
           matcher =>
@@ -1686,7 +1699,7 @@ export async function getMatchingHooks(
       : hookMatchers
 
     const matchedHooks: MatchedHook[] = filteredMatchers.flatMap(matcher => {
-      // Check if this is a PluginHookMatcher (has pluginRoot) or SkillHookMatcher (has skillRoot)
+      // 3. 根据 matcher 上的 root 字段判断来源是插件、技能还是普通设置。
       const pluginRoot =
         'pluginRoot' in matcher ? matcher.pluginRoot : undefined
       const pluginId = 'pluginId' in matcher ? matcher.pluginId : undefined
@@ -1709,17 +1722,7 @@ export async function getMatchingHooks(
       }))
     })
 
-    // Deduplicate hooks by command/prompt/url within the same source context.
-    // Key is namespaced by pluginRoot/skillRoot (see hookDedupKey above) so
-    // cross-plugin template collisions don't drop hooks (gh-29724).
-    //
-    // Note: new Map(entries) keeps the LAST entry on key collision, not first.
-    // For settings hooks this means the last-merged scope wins; for
-    // same-plugin duplicates the pluginRoot is identical so it doesn't matter.
-    // Fast-path: callback/function hooks don't need dedup (each is unique).
-    // Skip the 6-pass filter + 4×Map + 4×Array.from below when all hooks are
-    // callback/function — the common case for internal hooks like
-    // sessionFileAccessHooks/attributionHooks (44x faster in microbench).
+    // 4. callback/function hook 天然唯一；如果全是这类 hook，就跳过后面的去重成本。
     if (
       matchedHooks.every(
         m => m.hook.type === 'callback' || m.hook.type === 'function',
@@ -1728,8 +1731,7 @@ export async function getMatchingHooks(
       return matchedHooks
     }
 
-    // Helper to extract the `if` condition from a hook for dedup keys.
-    // Hooks with different `if` conditions are distinct even if otherwise identical.
+    // 5. if 条件属于 hook 身份的一部分；条件不同即使命令相同也不能去重。
     const getIfCondition = (hook: { if?: string }): string => hook.if ?? ''
 
     const uniqueCommandHooks = Array.from(
@@ -1741,10 +1743,7 @@ export async function getMatchingHooks(
             ): m is MatchedHook & { hook: HookCommand & { type: 'command' } } =>
               m.hook.type === 'command',
           )
-          // shell is part of identity: {command:'echo x', shell:'bash'}
-          // and {command:'echo x', shell:'powershell'} are distinct hooks,
-          // not duplicates. Default to 'bash' so legacy configs (no shell
-          // field) still dedup against explicit shell:'bash'.
+          // 6. shell 类型也参与命令 hook 身份；bash 和 PowerShell 同命令不是同一个 hook。
           .map(m => [
             hookDedupKey(
               m,
@@ -1794,7 +1793,7 @@ export async function getMatchingHooks(
       ).values(),
     )
     const callbackHooks = matchedHooks.filter(m => m.hook.type === 'callback')
-    // Function hooks don't need deduplication - each callback is unique
+    // 7. function hook 的回调实例唯一，不需要按内容去重。
     const functionHooks = matchedHooks.filter(m => m.hook.type === 'function')
     const uniqueHooks = [
       ...uniqueCommandHooks,
@@ -1805,9 +1804,7 @@ export async function getMatchingHooks(
       ...functionHooks,
     ]
 
-    // Filter hooks based on their `if` condition. This allows hooks to specify
-    // conditions like "Bash(git *)" to only run for git commands, avoiding
-    // process spawning overhead for non-matching commands.
+    // 8. 再按 if 条件过滤 hook，避免不相关命令也启动进程。
     const hasIfCondition = uniqueHooks.some(
       h =>
         (h.hook.type === 'command' ||
@@ -1847,9 +1844,7 @@ export async function getMatchingHooks(
       return false
     })
 
-    // HTTP hooks are not supported for SessionStart/Setup events. In headless
-    // mode the sandbox ask callback deadlocks because the structuredInput
-    // consumer hasn't started yet when these hooks fire.
+    // 9. SessionStart/Setup 阶段不支持 HTTP hook，避免无头模式下结构化输入消费者尚未启动造成死锁。
     const filteredHooks =
       hookEvent === 'SessionStart' || hookEvent === 'Setup'
         ? ifFilteredHooks.filter(h => {
@@ -1874,10 +1869,11 @@ export async function getMatchingHooks(
 }
 
 /**
- * Format a list of blocking errors from a PreTool hook's configured commands.
- * @param hookName The name of the hook (e.g., 'PreToolUse:Write', 'PreToolUse:Edit', 'PreToolUse:Bash')
- * @param blockingErrors Array of blocking errors from hooks
- * @returns Formatted blocking message
+ * 格式化 PreTool hook 的阻塞错误。
+ *
+ * @param hookName hook 展示名，例如 PreToolUse:Write。
+ * @param blockingError hook 返回的阻塞错误。
+ * @returns 传给调用方或模型的阻塞提示文本。
  */
 export function getPreToolHookBlockingMessage(
   hookName: string,
@@ -1887,18 +1883,20 @@ export function getPreToolHookBlockingMessage(
 }
 
 /**
- * Format a list of blocking errors from a Stop hook's configured commands.
- * @param blockingErrors Array of blocking errors from hooks
- * @returns Formatted message to give feedback to the model
+ * 格式化 Stop hook 的反馈消息。
+ *
+ * @param blockingError hook 返回的阻塞错误。
+ * @returns 反馈给模型的 Stop hook 文本。
  */
 export function getStopHookMessage(blockingError: HookBlockingError): string {
   return `Stop hook feedback:\n${blockingError.blockingError}`
 }
 
 /**
- * Format a blocking error from a TeammateIdle hook.
- * @param blockingError The blocking error from the hook
- * @returns Formatted message to give feedback to the model
+ * 格式化 TeammateIdle hook 的反馈消息。
+ *
+ * @param blockingError hook 返回的阻塞错误。
+ * @returns 反馈给模型的 TeammateIdle 文本。
  */
 export function getTeammateIdleHookMessage(
   blockingError: HookBlockingError,
@@ -1907,9 +1905,10 @@ export function getTeammateIdleHookMessage(
 }
 
 /**
- * Format a blocking error from a TaskCreated hook.
- * @param blockingError The blocking error from the hook
- * @returns Formatted message to give feedback to the model
+ * 格式化 TaskCreated hook 的反馈消息。
+ *
+ * @param blockingError hook 返回的阻塞错误。
+ * @returns 反馈给模型的 TaskCreated 文本。
  */
 export function getTaskCreatedHookMessage(
   blockingError: HookBlockingError,
@@ -1918,9 +1917,10 @@ export function getTaskCreatedHookMessage(
 }
 
 /**
- * Format a blocking error from a TaskCompleted hook.
- * @param blockingError The blocking error from the hook
- * @returns Formatted message to give feedback to the model
+ * 格式化 TaskCompleted hook 的反馈消息。
+ *
+ * @param blockingError hook 返回的阻塞错误。
+ * @returns 反馈给模型的 TaskCompleted 文本。
  */
 export function getTaskCompletedHookMessage(
   blockingError: HookBlockingError,
@@ -1929,9 +1929,10 @@ export function getTaskCompletedHookMessage(
 }
 
 /**
- * Format a list of blocking errors from a UserPromptSubmit hook's configured commands.
- * @param blockingErrors Array of blocking errors from hooks
- * @returns Formatted blocking message
+ * 格式化 UserPromptSubmit hook 的阻塞消息。
+ *
+ * @param blockingError hook 返回的阻塞错误。
+ * @returns 展示给调用方的用户提交阻塞文本。
  */
 export function getUserPromptSubmitHookBlockingMessage(
   blockingError: HookBlockingError,
@@ -1939,15 +1940,10 @@ export function getUserPromptSubmitHookBlockingMessage(
   return `UserPromptSubmit operation blocked by hook:\n${blockingError.blockingError}`
 }
 /**
- * Common logic for executing hooks
- * @param hookInput The structured hook input that will be validated and converted to JSON
- * @param toolUseID The ID for tracking this hook execution
- * @param matchQuery The query to match against hook matchers
- * @param signal Optional AbortSignal to cancel hook execution
- * @param timeoutMs Optional timeout in milliseconds for hook execution
- * @param toolUseContext Optional ToolUseContext for prompt-based hooks (required if using prompt hooks)
- * @param messages Optional conversation history for prompt/function hooks
- * @returns Async generator that yields progress messages and hook results
+ * 执行 REPL 内 hook 的通用流程。
+ *
+ * @param param0 hook 输入、匹配条件、超时、上下文和交互回调等执行参数。
+ * @returns 异步生成器，逐步产出进度消息、阻塞状态、权限决策和上下文更新。
  */
 async function* executeHooks({
   hookInput,
@@ -1975,6 +1971,7 @@ async function* executeHooks({
   ) => (request: PromptRequest) => Promise<PromptResponse>
   toolInputSummary?: string | null
 }): AsyncGenerator<AggregatedHookResult> {
+  // 1. 全局禁用 hook 或简单模式下直接跳过。
   if (shouldDisableAllHooksIncludingManaged()) {
     return
   }
@@ -1986,11 +1983,10 @@ async function* executeHooks({
   const hookEvent = hookInput.hook_event_name
   const hookName = matchQuery ? `${hookEvent}:${matchQuery}` : hookEvent
 
-  // Bind the prompt callback to this hook's name and tool input summary so the UI can display context
+  // 2. 绑定交互回调的 hook 名称和工具输入摘要，方便 UI 展示提问来源。
   const boundRequestPrompt = requestPrompt?.(hookName, toolInputSummary)
 
-  // SECURITY: ALL hooks require workspace trust in interactive mode
-  // This centralized check prevents RCE vulnerabilities for all current and future hooks
+  // 3. 交互模式下所有 hook 都必须通过工作区信任检查。
   if (shouldSkipHookDueToTrust()) {
     logForDebugging(
       `Skipping ${hookName} hook execution - workspace trust not accepted`,
@@ -1999,7 +1995,7 @@ async function* executeHooks({
   }
 
   const appState = toolUseContext ? toolUseContext.getAppState() : undefined
-  // Use the agent's session ID if available, otherwise fall back to main session
+  // 4. 优先使用代理会话 ID，避免子代理 hook 和主会话 hook 混用。
   const sessionId = toolUseContext?.agentId ?? getSessionId()
   const matchingHooks = await getMatchingHooks(
     appState,
@@ -2018,6 +2014,7 @@ async function* executeHooks({
 
   const userHooks = matchingHooks.filter(h => !isInternalHook(h))
   if (userHooks.length > 0) {
+    // 5. 只对用户可见 hook 记录分析事件，内部 callback 不计入用户 hook 数量。
     const pluginHookCounts = getPluginHookCounts(userHooks)
     const hookTypeCounts = getHookTypeCounts(userHooks)
     logEvent(`tengu_run_hook`, {
@@ -2034,10 +2031,7 @@ async function* executeHooks({
       }),
     })
   } else {
-    // Fast-path: all hooks are internal callbacks (sessionFileAccessHooks,
-    // attributionHooks). These return {} and don't use the abort signal, so we
-    // can skip span/progress/abortSignal/processHookJSONOutput/resultLoop.
-    // Measured: 6.01µs → ~1.8µs per PostToolUse hit (-70%).
+    // 6. 全是内部 callback 时走快速路径，跳过 span、进度、输出解析和聚合循环。
     const batchStartTime = Date.now()
     const context = toolUseContext
       ? {
@@ -2066,12 +2060,12 @@ async function* executeHooks({
     return
   }
 
-  // Collect hook definitions for beta tracing telemetry
+  // 7. 为 beta tracing 收集 hook 定义摘要。
   const hookDefinitionsJson = isBetaTracingEnabled()
     ? jsonStringify(getHookDefinitionsForTelemetry(matchingHooks))
     : '[]'
 
-  // Log hook execution start to OTEL (only for beta tracing)
+  // 8. beta tracing 开启时记录 hook 批次开始事件。
   if (isBetaTracingEnabled()) {
     void logOTelEvent('hook_execution_start', {
       hook_event: hookEvent,
@@ -2083,7 +2077,7 @@ async function* executeHooks({
     })
   }
 
-  // Start hook span for beta tracing
+  // 9. 为 hook 批次开启 tracing span。
   const hookSpan = startHookSpan(
     hookEvent,
     hookName,
@@ -2091,7 +2085,7 @@ async function* executeHooks({
     hookDefinitionsJson,
   )
 
-  // Yield progress messages for each hook before execution
+  // 10. 执行前先产出每个 hook 的进度消息。
   for (const { hook } of matchingHooks) {
     yield {
       message: {
@@ -2115,16 +2109,19 @@ async function* executeHooks({
     }
   }
 
-  // Track wall-clock time for the entire hook batch
+  // 11. 记录整个 hook 批次的墙钟耗时。
   const batchStartTime = Date.now()
 
-  // Lazy-once stringify of hookInput. Shared across all command/prompt/agent/http
-  // hooks in this batch (hookInput is never mutated). Callback/function hooks
-  // return before reaching this, so batches with only those pay no stringify cost.
+  // 12. hookInput 延迟序列化一次并复用，避免每个命令型 hook 重复 stringify。
   let jsonInputResult:
     | { ok: true; value: string }
     | { ok: false; error: unknown }
     | undefined
+  /**
+   * 延迟生成 hook 输入 JSON。
+   *
+   * @returns 序列化成功的 JSON 字符串，或序列化失败的错误对象。
+   */
   function getJsonInput() {
     if (jsonInputResult !== undefined) {
       return jsonInputResult
@@ -2139,7 +2136,7 @@ async function* executeHooks({
     }
   }
 
-  // Run all hooks in parallel with individual timeouts
+  // 13. 并行执行所有匹配 hook，每个 hook 使用独立超时信号。
   const hookPromises = matchingHooks.map(async function* (
     { hook, pluginRoot, pluginId, skillRoot },
     hookIndex,
@@ -2178,7 +2175,7 @@ async function* executeHooks({
         return
       }
 
-      // Function hooks only come from session storage with callback embedded
+      // 14. function hook 来自会话态，直接调用内嵌回调。
       yield executeFunctionHook({
         hook,
         messages,
@@ -2191,7 +2188,7 @@ async function* executeHooks({
       return
     }
 
-    // Command and prompt hooks need jsonInput
+    // 15. 命令、prompt、agent、HTTP hook 都需要共享 JSON 输入。
     const commandTimeoutMs = hook.timeout ? hook.timeout * 1000 : timeoutMs
     const { signal: abortSignal, cleanup } = createCombinedAbortSignal(signal, {
       timeoutMs: commandTimeoutMs,
@@ -2237,7 +2234,7 @@ async function* executeHooks({
           messages,
           toolUseID,
         )
-        // Inject timing fields for hook visibility
+        // 16. 为 prompt hook 注入耗时和退出状态，方便结果展示。
         if (promptResult.message?.type === 'attachment') {
           const att = promptResult.message.attachment
           if (
@@ -2277,7 +2274,7 @@ async function* executeHooks({
             ? (hookInput.agent_type as string)
             : undefined,
         )
-        // Inject timing fields for hook visibility
+        // 17. 为 agent hook 注入耗时和退出状态，方便结果展示。
         if (agentResult.message?.type === 'attachment') {
           const att = agentResult.message.attachment
           if (
@@ -2296,9 +2293,7 @@ async function* executeHooks({
       if (hook.type === 'http') {
         emitHookStarted(hookId, hookName, hookEvent)
 
-        // execHttpHook manages its own timeout internally via hook.timeout or
-        // DEFAULT_HTTP_HOOK_TIMEOUT_MS, so pass the parent signal directly
-        // to avoid double-stacking timeouts with abortSignal.
+        // 18. HTTP hook 自带超时处理，这里传父级信号避免叠加两层超时。
         const httpResult = await execHttpHook(
           hook,
           hookEvent,
@@ -2360,7 +2355,7 @@ async function* executeHooks({
           return
         }
 
-        // HTTP hooks must return JSON — parse and validate through Zod
+        // 19. HTTP hook 必须返回 JSON，并通过统一 schema 校验。
         const { json: httpJson, validationError: httpValidationError } =
           parseHttpHookOutput(httpResult.body)
 
@@ -2392,7 +2387,7 @@ async function* executeHooks({
         }
 
         if (httpJson && isAsyncHookJSONOutput(httpJson)) {
-          // Async response: treat as success (no further processing)
+          // 20. 异步响应已交给后台流程，当前批次只记录成功。
           emitHookResponse({
             hookId,
             hookName,
@@ -2496,7 +2491,7 @@ async function* executeHooks({
         return
       }
 
-      // Try JSON parsing first
+      // 21. 命令输出优先按 JSON 协议解析。
       const { json, plainText, validationError } = parseHookOutput(
         result.stdout,
       )
@@ -2531,7 +2526,7 @@ async function* executeHooks({
       }
 
       if (json) {
-        // Async responses were already backgrounded during execution
+        // 22. 异步响应已在命令执行阶段转入后台，这里不再处理 JSON 内容。
         if (isAsyncHookJSONOutput(json)) {
           yield {
             outcome: 'success' as const,
@@ -2540,7 +2535,7 @@ async function* executeHooks({
           return
         }
 
-        // Process JSON output
+        // 23. 同步 JSON 输出转换为内部 HookResult。
         const processed = processHookJSONOutput({
           json,
           command: hookCommand,
@@ -2554,14 +2549,14 @@ async function* executeHooks({
           durationMs,
         })
 
-        // Handle suppressOutput (skip for async responses)
+        // 24. suppressOutput 会隐藏成功输出，但不会隐藏阻塞结果。
         if (
           isSyncHookJSONOutput(json) &&
           !json.suppressOutput &&
           plainText &&
           result.status === 0
         ) {
-          // Still show non-JSON output if not suppressed
+          // 25. 未抑制时，普通文本输出仍作为 hook 成功附件展示。
           const content = `${chalk.bold(hookName)} completed`
           emitHookResponse({
             hookId,
@@ -2613,7 +2608,7 @@ async function* executeHooks({
         return
       }
 
-      // Fall back to existing logic for non-JSON output
+      // 26. 非 JSON 输出按传统 stdout/stderr 和退出码规则处理。
       if (result.status === 0) {
         emitHookResponse({
           hookId,
@@ -2644,7 +2639,7 @@ async function* executeHooks({
         return
       }
 
-      // Hooks with exit code 2 provide blocking feedback
+      // 27. 退出码 2 表示 hook 主动阻塞当前流程。
       if (result.status === 2) {
         emitHookResponse({
           hookId,
@@ -2667,8 +2662,7 @@ async function* executeHooks({
         return
       }
 
-      // Any other non-zero exit code is a non-critical error that should just
-      // be shown to the user.
+      // 28. 其他非零退出码是非阻塞错误，只展示给用户。
       emitHookResponse({
         hookId,
         hookName,
@@ -2696,7 +2690,7 @@ async function* executeHooks({
       }
       return
     } catch (error) {
-      // Clean up on error
+      // 29. hook 执行异常转成非阻塞错误，避免单个 hook 打断主流程。
       cleanup?.()
 
       const errorMessage =
@@ -2730,7 +2724,7 @@ async function* executeHooks({
     }
   })
 
-  // Track outcomes for logging
+  // 30. 收集每个 hook 的执行结论，用于日志和追踪。
   const outcomes = {
     success: 0,
     blocking: 0,
@@ -2740,11 +2734,11 @@ async function* executeHooks({
 
   let permissionBehavior: PermissionResult['behavior'] | undefined
 
-  // Run all hooks in parallel and wait for all to complete
+  // 31. 等待所有 hook 完成后按结果进行聚合产出。
   for await (const result of all(hookPromises)) {
     outcomes[result.outcome]++
 
-    // Check for preventContinuation early
+    // 32. preventContinuation 需要尽早产出，调用方可据此停止后续流程。
     if (result.preventContinuation) {
       logForDebugging(
         `Hook ${hookEvent} (${getHookDisplayText(result.hook)}) requested preventContinuation`,
@@ -2755,7 +2749,7 @@ async function* executeHooks({
       }
     }
 
-    // Handle different result types
+    // 33. 按结果内容分别产出阻塞错误和普通消息。
     if (result.blockingError) {
       yield {
         blockingError: result.blockingError,
@@ -2766,7 +2760,7 @@ async function* executeHooks({
       yield { message: result.message }
     }
 
-    // Yield system message separately if present
+    // 34. 系统消息单独产出，避免和普通附件消息混在一起。
     if (result.systemMessage) {
       yield {
         message: createAttachmentMessage({
@@ -2779,7 +2773,7 @@ async function* executeHooks({
       }
     }
 
-    // Collect additional context from hooks
+    // 35. 收集 hook 提供的额外上下文。
     if (result.additionalContext) {
       logForDebugging(
         `Hook ${hookEvent} (${getHookDisplayText(result.hook)}) provided additionalContext (${result.additionalContext.length} chars)`,
@@ -2807,7 +2801,7 @@ async function* executeHooks({
       }
     }
 
-    // Yield updatedMCPToolOutput if provided (from PostToolUse hooks)
+    // 36. PostToolUse 可修改 MCP 工具输出，需要单独产出。
     if (result.updatedMCPToolOutput) {
       logForDebugging(
         `Hook ${hookEvent} (${getHookDisplayText(result.hook)}) replaced MCP tool output`,
@@ -2817,36 +2811,36 @@ async function* executeHooks({
       }
     }
 
-    // Check for permission behavior with precedence: deny > ask > allow
+    // 37. 权限行为按 deny > ask > allow 的优先级聚合。
     if (result.permissionBehavior) {
       logForDebugging(
         `Hook ${hookEvent} (${getHookDisplayText(result.hook)}) returned permissionDecision: ${result.permissionBehavior}${result.hookPermissionDecisionReason ? ` (reason: ${result.hookPermissionDecisionReason})` : ''}`,
       )
-      // Apply precedence rules
+      // 38. 应用权限优先级规则。
       switch (result.permissionBehavior) {
         case 'deny':
-          // deny always takes precedence
+          // 39. deny 永远优先。
           permissionBehavior = 'deny'
           break
         case 'ask':
-          // ask takes precedence over allow but not deny
+          // 40. ask 可覆盖 allow，但不能覆盖 deny。
           if (permissionBehavior !== 'deny') {
             permissionBehavior = 'ask'
           }
           break
         case 'allow':
-          // allow only if no other behavior set
+          // 41. allow 只在没有更强决策时生效。
           if (!permissionBehavior) {
             permissionBehavior = 'allow'
           }
           break
         case 'passthrough':
-          // passthrough doesn't set permission behavior
+          // 42. passthrough 只允许修改输入，不产生权限决策。
           break
       }
     }
 
-    // Yield permission behavior and updatedInput if provided (from allow or ask behavior)
+    // 43. allow/ask 场景下同时产出权限行为和可能被 hook 修改的输入。
     if (permissionBehavior !== undefined) {
       const updatedInput =
         result.updatedInput &&
@@ -2867,9 +2861,7 @@ async function* executeHooks({
       }
     }
 
-    // Yield updatedInput separately for passthrough case (no permission decision)
-    // This allows hooks to modify input without making a permission decision
-    // Note: Check result.permissionBehavior (this hook's behavior), not the aggregated permissionBehavior
+    // 44. passthrough 场景只产出 updatedInput，不改变聚合后的权限决策。
     if (result.updatedInput && result.permissionBehavior === undefined) {
       logForDebugging(
         `Hook ${hookEvent} (${getHookDisplayText(result.hook)}) modified tool input keys: [${Object.keys(result.updatedInput).join(', ')}]`,
@@ -2878,35 +2870,35 @@ async function* executeHooks({
         updatedInput: result.updatedInput,
       }
     }
-    // Yield permission request result if provided (from PermissionRequest hooks)
+    // 45. PermissionRequest hook 可直接产出结构化权限请求结果。
     if (result.permissionRequestResult) {
       yield {
         permissionRequestResult: result.permissionRequestResult,
       }
     }
-    // Yield retry flag if provided (from PermissionDenied hooks)
+    // 46. PermissionDenied hook 可请求重试。
     if (result.retry) {
       yield {
         retry: result.retry,
       }
     }
-    // Yield elicitation response if provided (from Elicitation hooks)
+    // 47. Elicitation hook 可产出用户征询响应。
     if (result.elicitationResponse) {
       yield {
         elicitationResponse: result.elicitationResponse,
       }
     }
-    // Yield elicitation result response if provided (from ElicitationResult hooks)
+    // 48. ElicitationResult hook 可产出对征询结果的响应。
     if (result.elicitationResultResponse) {
       yield {
         elicitationResultResponse: result.elicitationResultResponse,
       }
     }
 
-    // Invoke session hook callback if this is a command/prompt/function hook (not a callback hook)
+    // 49. 命令、prompt 和 function hook 成功后触发会话 hook 回调。
     if (appState && result.hook.type !== 'callback') {
       const sessionId = getSessionId()
-      // Use empty string as matcher when matchQuery is undefined (e.g., for Stop hooks)
+      // 50. 没有 matchQuery 的事件使用空字符串作为回调 matcher。
       const matcher = matchQuery ?? ''
       const hookEntry = getSessionHookCallback(
         appState,
@@ -2915,7 +2907,7 @@ async function* executeHooks({
         matcher,
         result.hook,
       )
-      // Invoke onHookSuccess only on success outcome
+      // 51. 只有成功结果才调用 onHookSuccess。
       if (hookEntry?.onHookSuccess && result.outcome === 'success') {
         try {
           hookEntry.onHookSuccess(result.hook, result as AggregatedHookResult)
@@ -2943,7 +2935,7 @@ async function* executeHooks({
     totalDurationMs,
   })
 
-  // Log hook execution completion to OTEL (only for beta tracing)
+  // 52. beta tracing 开启时记录 hook 批次完成事件。
   if (isBetaTracingEnabled()) {
     const hookDefinitionsComplete =
       getHookDefinitionsForTelemetry(matchingHooks)
@@ -2962,7 +2954,7 @@ async function* executeHooks({
     })
   }
 
-  // End hook span for beta tracing
+  // 53. 结束 tracing span，并写入聚合后的执行结果。
   endHookSpan(hookSpan, {
     numSuccess: outcomes.success,
     numBlocking: outcomes.blocking,
@@ -2971,34 +2963,44 @@ async function* executeHooks({
   })
 }
 
+/**
+ * 非 REPL hook 的执行结果。
+ *
+ * 场景：通知、会话结束、worktree 和环境变更等不需要流式返回给模型的 hook。
+ */
 export type HookOutsideReplResult = {
+  /** hook 命令、URL 或回调标识。 */
   command: string
+  /** 是否成功完成。 */
   succeeded: boolean
+  /** 用于调用方消费或展示的输出文本。 */
   output: string
+  /** 是否产生阻塞结果。 */
   blocked: boolean
+  /** hook 要求继续观察的路径列表。 */
   watchPaths?: string[]
+  /** hook 返回的系统消息。 */
   systemMessage?: string
 }
 
+/**
+ * 判断非 REPL hook 结果中是否存在阻塞项。
+ *
+ * @param results 非 REPL hook 执行结果列表。
+ * @returns true 表示至少有一个 hook 阻塞了流程。
+ */
 export function hasBlockingResult(results: HookOutsideReplResult[]): boolean {
   return results.some(r => r.blocked)
 }
 
 /**
- * Execute hooks outside of the REPL (e.g. notifications, session end)
+ * 在 REPL 主循环之外执行 hook。
  *
- * Unlike executeHooks() which yields messages that are exposed to the model as
- * system messages, this function only logs errors via logForDebugging (visible
- * with --debug). Callers that need to surface errors to users should handle
- * the returned results appropriately (e.g. executeSessionEndHooks writes to
- * stderr during shutdown).
+ * 适用于通知、会话结束、worktree 等不需要把进度消息直接流式暴露给模型的场景。
+ * 错误默认只写调试日志；如果调用方需要展示给用户，应自行处理返回结果。
  *
- * @param getAppState Optional function to get the current app state (for session hooks)
- * @param hookInput The structured hook input that will be validated and converted to JSON
- * @param matchQuery The query to match against hook matchers
- * @param signal Optional AbortSignal to cancel hook execution
- * @param timeoutMs Optional timeout in milliseconds for hook execution
- * @returns Array of HookOutsideReplResult objects containing command, succeeded, and output
+ * @param param0 非 REPL hook 的输入、匹配条件、超时、取消信号和可选应用状态。
+ * @returns 每个 hook 的命令、成功状态、输出和阻塞标记。
  */
 async function executeHooksOutsideREPL({
   getAppState,
@@ -3026,8 +3028,7 @@ async function executeHooksOutsideREPL({
     return []
   }
 
-  // SECURITY: ALL hooks require workspace trust in interactive mode
-  // This centralized check prevents RCE vulnerabilities for all current and future hooks
+  // 1. 交互模式下所有 hook 都必须通过工作区信任检查。
   if (shouldSkipHookDueToTrust()) {
     logForDebugging(
       `Skipping ${hookName} hook execution - workspace trust not accepted`,
@@ -3036,7 +3037,7 @@ async function executeHooksOutsideREPL({
   }
 
   const appState = getAppState ? getAppState() : undefined
-  // Use main session ID for outside-REPL hooks
+  // 2. 非 REPL hook 使用主会话 ID。
   const sessionId = getSessionId()
   const matchingHooks = await getMatchingHooks(
     appState,
@@ -3071,7 +3072,7 @@ async function executeHooksOutsideREPL({
     })
   }
 
-  // Validate and stringify the hook input
+  // 3. 先序列化结构化输入，失败时返回单条失败结果。
   let jsonInput: string
   try {
     jsonInput = jsonStringify(hookInput)
@@ -3080,10 +3081,10 @@ async function executeHooksOutsideREPL({
     return []
   }
 
-  // Run all hooks in parallel with individual timeouts
+  // 4. 并行执行匹配到的 hook，每个 hook 使用自己的超时。
   const hookPromises = matchingHooks.map(
     async ({ hook, pluginRoot, pluginId }, hookIndex) => {
-      // Handle callback hooks
+      // 5. callback hook 直接执行回调并转换为非 REPL 结果。
       if (hook.type === 'callback') {
         const callbackTimeoutMs = hook.timeout ? hook.timeout * 1000 : timeoutMs
         const { signal: abortSignal, cleanup } = createCombinedAbortSignal(
@@ -3149,7 +3150,7 @@ async function executeHooksOutsideREPL({
         }
       }
 
-      // TODO: Implement prompt stop hooks outside REPL
+      // 6. prompt hook 暂不支持非 REPL 路径，返回非阻塞错误。
       if (hook.type === 'prompt') {
         return {
           command: hook.prompt,
@@ -3159,7 +3160,7 @@ async function executeHooksOutsideREPL({
         }
       }
 
-      // TODO: Implement agent stop hooks outside REPL
+      // 7. agent hook 暂不支持非 REPL 路径，返回非阻塞错误。
       if (hook.type === 'agent') {
         return {
           command: hook.prompt,
@@ -3169,8 +3170,7 @@ async function executeHooksOutsideREPL({
         }
       }
 
-      // Function hooks require messages array (only available in REPL context)
-      // For -p mode Stop hooks, use executeStopHooks which supports function hooks
+      // 8. function hook 需要对话消息，只能走 REPL 路径或专门的 Stop 路径。
       if (hook.type === 'function') {
         logError(
           new Error(
@@ -3185,9 +3185,7 @@ async function executeHooksOutsideREPL({
         }
       }
 
-      // Handle HTTP hooks (no toolUseContext needed - just HTTP POST).
-      // execHttpHook handles its own timeout internally via hook.timeout or
-      // DEFAULT_HTTP_HOOK_TIMEOUT_MS, so we pass signal directly.
+      // 9. HTTP hook 不依赖 ToolUseContext，直接 POST 结构化输入。
       if (hook.type === 'http') {
         try {
           const httpResult = await execHttpHook(
@@ -3222,7 +3220,7 @@ async function executeHooksOutsideREPL({
             }
           }
 
-          // HTTP hooks must return JSON — parse and validate through Zod
+          // 10. HTTP hook 必须返回 JSON，并用统一 schema 校验。
           const { json: httpJson, validationError: httpValidationError } =
             parseHttpHookOutput(httpResult.body)
           if (httpValidationError) {
@@ -3240,11 +3238,7 @@ async function executeHooksOutsideREPL({
             isSyncHookJSONOutput(httpJson) &&
             httpJson.decision === 'block'
 
-          // WorktreeCreate's consumer reads `output` as the bare filesystem
-          // path. Command hooks provide it via stdout; http hooks provide it
-          // via hookSpecificOutput.worktreePath. Without worktreePath, emit ''
-          // so the consumer's length filter skips it instead of treating the
-          // raw '{}' body as a path.
+          // 11. WorktreeCreate 需要裸路径输出；HTTP hook 从 hookSpecificOutput.worktreePath 取值。
           const output =
             hookEvent === 'WorktreeCreate'
               ? httpJson &&
@@ -3276,7 +3270,7 @@ async function executeHooksOutsideREPL({
         }
       }
 
-      // Handle command hooks
+      // 12. 命令 hook 走标准命令执行路径。
       const commandTimeoutMs = hook.timeout ? hook.timeout * 1000 : timeoutMs
       const { signal: abortSignal, cleanup } = createCombinedAbortSignal(
         signal,
@@ -3295,7 +3289,7 @@ async function executeHooksOutsideREPL({
           pluginId,
         )
 
-        // Clear timeout if hook completes
+        // 13. hook 完成后清理当前超时控制器。
         cleanup?.()
 
         if (result.aborted) {
@@ -3312,10 +3306,10 @@ async function executeHooksOutsideREPL({
           `${hookName} [${hook.command}] completed with status ${result.status}`,
         )
 
-        // Parse JSON for any messages to print out.
+        // 14. 尝试解析 JSON 输出，用于获取系统消息、watchPaths 或阻塞决策。
         const { json, validationError } = parseHookOutput(result.stdout)
         if (validationError) {
-          // Validation error is logged via logForDebugging and returned in output
+          // 15. JSON 校验错误作为失败输出返回，供调用方决定是否展示。
           throw new Error(validationError)
         }
         if (json && !isAsyncHookJSONOutput(json)) {
@@ -3325,7 +3319,7 @@ async function executeHooksOutsideREPL({
           )
         }
 
-        // Blocked if exit code 2 or JSON decision: 'block'
+        // 16. 退出码 2 或 JSON decision=block 都表示阻塞。
         const jsonBlocked =
           json &&
           !isAsyncHookJSONOutput(json) &&
@@ -3333,7 +3327,7 @@ async function executeHooksOutsideREPL({
           json.decision === 'block'
         const blocked = result.status === 2 || !!jsonBlocked
 
-        // For successful hooks (exit code 0), use stdout; for failed hooks, use stderr
+        // 17. 成功时输出 stdout，失败时优先输出 stderr。
         const output =
           result.status === 0 ? result.stdout || '' : result.stderr || ''
 
@@ -3357,7 +3351,7 @@ async function executeHooksOutsideREPL({
           systemMessage,
         }
       } catch (error) {
-        // Clean up on error
+        // 18. 执行异常转成失败结果，避免非 REPL 调用方直接抛错。
         cleanup?.()
 
         const errorMessage =
@@ -3376,20 +3370,21 @@ async function executeHooksOutsideREPL({
     },
   )
 
-  // Wait for all hooks to complete and collect results
+  // 19. 等待全部 hook 完成并收集结果。
   return await Promise.all(hookPromises)
 }
 
 /**
- * Execute pre-tool hooks if configured
- * @param toolName The name of the tool (e.g., 'Write', 'Edit', 'Bash')
- * @param toolUseID The ID of the tool use
- * @param toolInput The input that will be passed to the tool
- * @param permissionMode Optional permission mode from toolPermissionContext
- * @param signal Optional AbortSignal to cancel hook execution
- * @param timeoutMs Optional timeout in milliseconds for hook execution
- * @param toolUseContext Optional ToolUseContext for prompt-based hooks
- * @returns Async generator that yields progress messages and returns blocking errors
+ * 执行工具调用前的 hook。
+ *
+ * @param toolName 即将调用的工具名。
+ * @param toolUseID 工具调用 ID。
+ * @param toolInput 即将传给工具的输入。
+ * @param permissionMode 当前权限模式，可为空。
+ * @param signal 可选取消信号。
+ * @param timeoutMs hook 执行超时，单位毫秒。
+ * @param toolUseContext 工具调用上下文，prompt/agent hook 需要它。
+ * @returns 异步生成器，产出进度、阻塞错误和权限/输入更新。
  */
 export async function* executePreToolHooks<ToolInput>(
   toolName: string,
@@ -3436,16 +3431,17 @@ export async function* executePreToolHooks<ToolInput>(
 }
 
 /**
- * Execute post-tool hooks if configured
- * @param toolName The name of the tool (e.g., 'Write', 'Edit', 'Bash')
- * @param toolUseID The ID of the tool use
- * @param toolInput The input that was passed to the tool
- * @param toolResponse The response from the tool
- * @param toolUseContext ToolUseContext for prompt-based hooks
- * @param permissionMode Optional permission mode from toolPermissionContext
- * @param signal Optional AbortSignal to cancel hook execution
- * @param timeoutMs Optional timeout in milliseconds for hook execution
- * @returns Async generator that yields progress messages and blocking errors for automated feedback
+ * 执行工具调用成功后的 hook。
+ *
+ * @param toolName 已调用的工具名。
+ * @param toolUseID 工具调用 ID。
+ * @param toolInput 传给工具的输入。
+ * @param toolResponse 工具返回结果。
+ * @param toolUseContext 工具调用上下文。
+ * @param permissionMode 当前权限模式，可为空。
+ * @param signal 可选取消信号。
+ * @param timeoutMs hook 执行超时，单位毫秒。
+ * @returns 异步生成器，产出进度、追加上下文和自动反馈所需的阻塞信息。
  */
 export async function* executePostToolHooks<ToolInput, ToolResponse>(
   toolName: string,
@@ -3477,17 +3473,18 @@ export async function* executePostToolHooks<ToolInput, ToolResponse>(
 }
 
 /**
- * Execute post-tool-use-failure hooks if configured
- * @param toolName The name of the tool (e.g., 'Write', 'Edit', 'Bash')
- * @param toolUseID The ID of the tool use
- * @param toolInput The input that was passed to the tool
- * @param error The error message from the failed tool call
- * @param toolUseContext ToolUseContext for prompt-based hooks
- * @param isInterrupt Whether the tool was interrupted by user
- * @param permissionMode Optional permission mode from toolPermissionContext
- * @param signal Optional AbortSignal to cancel hook execution
- * @param timeoutMs Optional timeout in milliseconds for hook execution
- * @returns Async generator that yields progress messages and blocking errors
+ * 执行工具调用失败后的 hook。
+ *
+ * @param toolName 失败的工具名。
+ * @param toolUseID 工具调用 ID。
+ * @param toolInput 传给工具的输入。
+ * @param error 工具调用失败信息。
+ * @param toolUseContext 工具调用上下文。
+ * @param isInterrupt 是否由用户中断导致失败。
+ * @param permissionMode 当前权限模式，可为空。
+ * @param signal 可选取消信号。
+ * @param timeoutMs hook 执行超时，单位毫秒。
+ * @returns 异步生成器，产出进度和阻塞错误。
  */
 export async function* executePostToolUseFailureHooks<ToolInput>(
   toolName: string,
@@ -3526,6 +3523,19 @@ export async function* executePostToolUseFailureHooks<ToolInput>(
   })
 }
 
+/**
+ * 执行权限拒绝后的 hook。
+ *
+ * @param toolName 被拒绝权限的工具名。
+ * @param toolUseID 工具调用 ID。
+ * @param toolInput 原始工具输入。
+ * @param error 权限拒绝原因。
+ * @param toolUseContext 工具调用上下文。
+ * @param permissionMode 当前权限模式，可为空。
+ * @param signal 可选取消信号。
+ * @param timeoutMs hook 执行超时，单位毫秒。
+ * @returns 异步生成器，产出进度、重试标记和 hook 结果。
+ */
 export async function* executePermissionDeniedHooks<ToolInput>(
   toolName: string,
   toolUseID: string,
@@ -3562,10 +3572,11 @@ export async function* executePermissionDeniedHooks<ToolInput>(
 }
 
 /**
- * Execute notification hooks if configured
- * @param notificationData The notification data to pass to hooks
- * @param timeoutMs Optional timeout in milliseconds for hook execution
- * @returns Promise that resolves when all hooks complete
+ * 执行通知类 hook。
+ *
+ * @param notificationData 传给 hook 的通知数据。
+ * @param timeoutMs hook 执行超时，单位毫秒。
+ * @returns 所有通知 hook 完成后的 Promise。
  */
 export async function executeNotificationHooks(
   notificationData: {
@@ -3591,24 +3602,27 @@ export async function executeNotificationHooks(
   })
 }
 
+/**
+ * 执行 StopFailure hook。
+ *
+ * @param error 停止失败的错误信息，可为空。
+ * @param timeoutMs hook 执行超时，单位毫秒。
+ * @returns 所有 StopFailure hook 完成后的 Promise。
+ */
 export async function executeStopFailureHooks(
   lastMessage: AssistantMessage,
   toolUseContext?: ToolUseContext,
   timeoutMs: number = TOOL_HOOK_EXECUTION_TIMEOUT_MS,
 ): Promise<void> {
   const appState = toolUseContext?.getAppState()
-  // executeHooksOutsideREPL hardcodes main sessionId (:2738). Agent frontmatter
-  // hooks (registerFrontmatterHooks) key by agentId; gating with agentId here
-  // would pass the gate but fail execution. Align gate with execution.
+  // 1. executeHooksOutsideREPL 固定使用主会话 ID，这里也按主会话检查，避免 agentId 通过预检却执行不到。
   const sessionId = getSessionId()
   if (!hasHookForEvent('StopFailure', appState, sessionId)) return
 
   const lastAssistantText =
     extractTextContent(lastMessage.message.content, '\n').trim() || undefined
 
-  // Some createAssistantAPIErrorMessage call sites omit `error` (e.g.
-  // image-size at errors.ts:431). Default to 'unknown' so matcher filtering
-  // at getMatchingHooks:1525 always applies.
+  // 2. 部分调用点没有 error 字段，默认 unknown，确保 matcher 过滤仍有稳定输入。
   const error = lastMessage.error ?? 'unknown'
   const hookInput: StopFailureHookInput = {
     ...createBaseHookInput(undefined, undefined, toolUseContext),
@@ -3627,14 +3641,15 @@ export async function executeStopFailureHooks(
 }
 
 /**
- * Execute stop hooks if configured
- * @param toolUseContext ToolUseContext for prompt-based hooks
- * @param permissionMode permission mode from toolPermissionContext
- * @param signal AbortSignal to cancel hook execution
- * @param stopHookActive Whether this call is happening within another stop hook
- * @param isSubagent Whether the current execution context is a subagent
- * @param messages Optional conversation history for prompt/function hooks
- * @returns Async generator that yields progress messages and blocking errors
+ * 执行 Stop hook。
+ *
+ * @param toolUseContext 工具调用上下文，prompt/agent hook 需要它。
+ * @param permissionMode 当前权限模式。
+ * @param signal 取消信号。
+ * @param stopHookActive 当前调用是否发生在另一个 Stop hook 内。
+ * @param isSubagent 当前上下文是否为子代理。
+ * @param messages prompt/function hook 需要的对话历史。
+ * @returns 异步生成器，产出进度和阻塞错误。
  */
 export async function* executeStopHooks(
   permissionMode?: string,
@@ -3657,8 +3672,7 @@ export async function* executeStopHooks(
     return
   }
 
-  // Extract text content from the last assistant message so hooks can
-  // inspect the final response without reading the transcript file.
+  // 1. 提取最后一条助手消息文本，让 hook 不读转录文件也能检查最终回复。
   const lastAssistantMessage = messages
     ? getLastAssistantMessage(messages)
     : undefined
@@ -3684,7 +3698,7 @@ export async function* executeStopHooks(
         last_assistant_message: lastAssistantText,
       }
 
-  // Trust check is now centralized in executeHooks()
+  // 2. 工作区信任检查由 executeHooks 统一处理。
   yield* executeHooks({
     hookInput,
     toolUseID: randomUUID(),
@@ -3697,14 +3711,14 @@ export async function* executeStopHooks(
 }
 
 /**
- * Execute TeammateIdle hooks when a teammate is about to go idle.
- * If a hook blocks (exit code 2), the teammate should continue working instead of going idle.
- * @param teammateName The name of the teammate going idle
- * @param teamName The team this teammate belongs to
- * @param permissionMode Optional permission mode
- * @param signal Optional AbortSignal to cancel hook execution
- * @param timeoutMs Optional timeout in milliseconds for hook execution
- * @returns Async generator that yields progress messages and blocking errors
+ * 在队友即将进入空闲状态前执行 TeammateIdle hook。
+ *
+ * @param teammateName 即将空闲的队友名称。
+ * @param teamName 队友所属团队名称。
+ * @param permissionMode 当前权限模式，可为空。
+ * @param signal 可选取消信号。
+ * @param timeoutMs hook 执行超时，单位毫秒。
+ * @returns 异步生成器；如果 hook 阻塞，调用方应让队友继续工作。
  */
 export async function* executeTeammateIdleHooks(
   teammateName: string,
@@ -3729,18 +3743,18 @@ export async function* executeTeammateIdleHooks(
 }
 
 /**
- * Execute TaskCreated hooks when a task is being created.
- * If a hook blocks (exit code 2), the task creation should be prevented and feedback returned.
- * @param taskId The ID of the task being created
- * @param taskSubject The subject/title of the task
- * @param taskDescription Optional description of the task
- * @param teammateName Optional name of the teammate creating the task
- * @param teamName Optional team name
- * @param permissionMode Optional permission mode
- * @param signal Optional AbortSignal to cancel hook execution
- * @param timeoutMs Optional timeout in milliseconds for hook execution
- * @param toolUseContext Optional ToolUseContext for resolving appState and sessionId
- * @returns Async generator that yields progress messages and blocking errors
+ * 创建任务时执行 TaskCreated hook。
+ *
+ * @param taskId 正在创建的任务 ID。
+ * @param taskSubject 任务标题。
+ * @param taskDescription 可选任务描述。
+ * @param teammateName 创建任务的队友名称，可为空。
+ * @param teamName 团队名称，可为空。
+ * @param permissionMode 当前权限模式，可为空。
+ * @param signal 可选取消信号。
+ * @param timeoutMs hook 执行超时，单位毫秒。
+ * @param toolUseContext 可选工具上下文，用于解析 appState 和 sessionId。
+ * @returns 异步生成器；如果 hook 阻塞，调用方应阻止任务创建并返回反馈。
  */
 export async function* executeTaskCreatedHooks(
   taskId: string,
@@ -3773,18 +3787,18 @@ export async function* executeTaskCreatedHooks(
 }
 
 /**
- * Execute TaskCompleted hooks when a task is being marked as completed.
- * If a hook blocks (exit code 2), the task completion should be prevented and feedback returned.
- * @param taskId The ID of the task being completed
- * @param taskSubject The subject/title of the task
- * @param taskDescription Optional description of the task
- * @param teammateName Optional name of the teammate completing the task
- * @param teamName Optional team name
- * @param permissionMode Optional permission mode
- * @param signal Optional AbortSignal to cancel hook execution
- * @param timeoutMs Optional timeout in milliseconds for hook execution
- * @param toolUseContext Optional ToolUseContext for resolving appState and sessionId
- * @returns Async generator that yields progress messages and blocking errors
+ * 标记任务完成时执行 TaskCompleted hook。
+ *
+ * @param taskId 正在完成的任务 ID。
+ * @param taskSubject 任务标题。
+ * @param taskDescription 可选任务描述。
+ * @param teammateName 完成任务的队友名称，可为空。
+ * @param teamName 团队名称，可为空。
+ * @param permissionMode 当前权限模式，可为空。
+ * @param signal 可选取消信号。
+ * @param timeoutMs hook 执行超时，单位毫秒。
+ * @param toolUseContext 可选工具上下文，用于解析 appState 和 sessionId。
+ * @returns 异步生成器；如果 hook 阻塞，调用方应阻止任务完成并返回反馈。
  */
 export async function* executeTaskCompletedHooks(
   taskId: string,
@@ -3817,11 +3831,12 @@ export async function* executeTaskCompletedHooks(
 }
 
 /**
- * Execute start hooks if configured
- * @param prompt The user prompt that will be passed to the tool
- * @param permissionMode Permission mode from toolPermissionContext
- * @param toolUseContext ToolUseContext for prompt-based hooks
- * @returns Async generator that yields progress messages and hook results
+ * 执行用户提交提示词时的 hook。
+ *
+ * @param prompt 用户提交的提示词。
+ * @param permissionMode 当前权限模式。
+ * @param toolUseContext 工具调用上下文。
+ * @returns 异步生成器，产出进度、阻塞错误和追加上下文。
  */
 export async function* executeUserPromptSubmitHooks(
   prompt: string,
@@ -3855,14 +3870,15 @@ export async function* executeUserPromptSubmitHooks(
 }
 
 /**
- * Execute session start hooks if configured
- * @param source The source of the session start (startup, resume, clear)
- * @param sessionId Optional The session id to use as hook input
- * @param agentType Optional The agent type (from --agent flag) running this session
- * @param model Optional The model being used for this session
- * @param signal Optional AbortSignal to cancel hook execution
- * @param timeoutMs Optional timeout in milliseconds for hook execution
- * @returns Async generator that yields progress messages and hook results
+ * 执行会话启动 hook。
+ *
+ * @param source 会话启动来源，例如启动、恢复或清理后重启。
+ * @param sessionId 可选会话 ID；传入时作为 hook 输入。
+ * @param agentType 可选代理类型，通常来自 --agent。
+ * @param model 当前会话使用的模型名称，可为空。
+ * @param signal 可选取消信号。
+ * @param timeoutMs hook 执行超时，单位毫秒。
+ * @returns 异步生成器，产出进度和 hook 结果。
  */
 export async function* executeSessionStartHooks(
   source: 'startup' | 'resume' | 'clear' | 'compact',
@@ -3892,12 +3908,13 @@ export async function* executeSessionStartHooks(
 }
 
 /**
- * Execute setup hooks if configured
- * @param trigger The trigger type ('init' or 'maintenance')
- * @param signal Optional AbortSignal to cancel hook execution
- * @param timeoutMs Optional timeout in milliseconds for hook execution
- * @param forceSyncExecution If true, async hooks will not be backgrounded
- * @returns Async generator that yields progress messages and hook results
+ * 执行 setup hook。
+ *
+ * @param trigger setup 触发类型，例如 init 或 maintenance。
+ * @param signal 可选取消信号。
+ * @param timeoutMs hook 执行超时，单位毫秒。
+ * @param forceSyncExecution 为 true 时，即使 hook 声明异步也强制等待完成。
+ * @returns 异步生成器，产出进度和 hook 结果。
  */
 export async function* executeSetupHooks(
   trigger: 'init' | 'maintenance',
@@ -3922,12 +3939,13 @@ export async function* executeSetupHooks(
 }
 
 /**
- * Execute subagent start hooks if configured
- * @param agentId The unique identifier for the subagent
- * @param agentType The type/name of the subagent being started
- * @param signal Optional AbortSignal to cancel hook execution
- * @param timeoutMs Optional timeout in milliseconds for hook execution
- * @returns Async generator that yields progress messages and hook results
+ * 执行子代理启动 hook。
+ *
+ * @param agentId 子代理唯一 ID。
+ * @param agentType 正在启动的子代理类型或名称。
+ * @param signal 可选取消信号。
+ * @param timeoutMs hook 执行超时，单位毫秒。
+ * @returns 异步生成器，产出进度和 hook 结果。
  */
 export async function* executeSubagentStartHooks(
   agentId: string,
@@ -3952,11 +3970,12 @@ export async function* executeSubagentStartHooks(
 }
 
 /**
- * Execute pre-compact hooks if configured
- * @param compactData The compact data to pass to hooks
- * @param signal Optional AbortSignal to cancel hook execution
- * @param timeoutMs Optional timeout in milliseconds for hook execution
- * @returns Object with optional newCustomInstructions and userDisplayMessage
+ * 执行压缩前 hook。
+ *
+ * @param compactData 传给 hook 的压缩输入数据。
+ * @param signal 可选取消信号。
+ * @param timeoutMs hook 执行超时，单位毫秒。
+ * @returns 可能包含新自定义指令和用户展示消息的对象。
  */
 export async function executePreCompactHooks(
   compactData: {
@@ -3987,12 +4006,12 @@ export async function executePreCompactHooks(
     return {}
   }
 
-  // Extract custom instructions from successful hooks with non-empty output
+  // 1. 从成功且有输出的 hook 中提取新的自定义指令。
   const successfulOutputs = results
     .filter(result => result.succeeded && result.output.trim().length > 0)
     .map(result => result.output.trim())
 
-  // Build user display messages with command info
+  // 2. 构造包含命令信息的用户展示消息。
   const displayMessages: string[] = []
   for (const result of results) {
     if (result.succeeded) {
@@ -4025,11 +4044,12 @@ export async function executePreCompactHooks(
 }
 
 /**
- * Execute post-compact hooks if configured
- * @param compactData The compact data to pass to hooks, including the summary
- * @param signal Optional AbortSignal to cancel hook execution
- * @param timeoutMs Optional timeout in milliseconds for hook execution
- * @returns Object with optional userDisplayMessage
+ * 执行压缩后 hook。
+ *
+ * @param compactData 传给 hook 的压缩数据，包含摘要。
+ * @param signal 可选取消信号。
+ * @param timeoutMs hook 执行超时，单位毫秒。
+ * @returns 可能包含用户展示消息的对象。
  */
 export async function executePostCompactHooks(
   compactData: {
@@ -4089,10 +4109,11 @@ export async function executePostCompactHooks(
 }
 
 /**
- * Execute session end hooks if configured
- * @param reason The reason for ending the session
- * @param options Optional parameters including app state functions and signal
- * @returns Promise that resolves when all hooks complete
+ * 执行会话结束 hook。
+ *
+ * @param reason 会话结束原因。
+ * @param options 可选参数，包含应用状态获取函数和取消信号。
+ * @returns 所有 SessionEnd hook 完成后的 Promise。
  */
 export async function executeSessionEndHooks(
   reason: ExitReason,
@@ -4124,7 +4145,7 @@ export async function executeSessionEndHooks(
     timeoutMs,
   })
 
-  // During shutdown, Ink is unmounted so we can write directly to stderr
+  // 1. 关闭阶段 Ink 已卸载，可直接把 hook 失败信息写到 stderr。
   for (const result of results) {
     if (!result.succeeded && result.output) {
       process.stderr.write(
@@ -4133,7 +4154,7 @@ export async function executeSessionEndHooks(
     }
   }
 
-  // Clear session hooks after execution
+  // 2. SessionEnd hook 执行后清理会话级 hook，避免泄漏到后续会话。
   if (setAppState) {
     const sessionId = getSessionId()
     clearSessionHooks(setAppState, sessionId)
@@ -4141,18 +4162,19 @@ export async function executeSessionEndHooks(
 }
 
 /**
- * Execute permission request hooks if configured
- * These hooks are called when a permission dialog would be displayed to the user.
- * Hooks can approve or deny the permission request programmatically.
- * @param toolName The name of the tool requesting permission
- * @param toolUseID The ID of the tool use
- * @param toolInput The input that would be passed to the tool
- * @param toolUseContext ToolUseContext for the request
- * @param permissionMode Optional permission mode from toolPermissionContext
- * @param permissionSuggestions Optional permission suggestions (the "always allow" options)
- * @param signal Optional AbortSignal to cancel hook execution
- * @param timeoutMs Optional timeout in milliseconds for hook execution
- * @returns Async generator that yields progress messages and returns aggregated result
+ * 执行权限请求 hook。
+ *
+ * 当系统本应向用户展示权限弹窗时触发，hook 可以用程序化方式允许或拒绝请求。
+ *
+ * @param toolName 请求权限的工具名。
+ * @param toolUseID 工具调用 ID。
+ * @param toolInput 将传给工具的输入。
+ * @param toolUseContext 当前工具调用上下文。
+ * @param permissionMode 当前权限模式，可为空。
+ * @param permissionSuggestions 可选权限建议，例如 always allow 选项。
+ * @param signal 可选取消信号。
+ * @param timeoutMs hook 执行超时，单位毫秒。
+ * @returns 异步生成器，产出进度和聚合后的权限请求结果。
  */
 export async function* executePermissionRequestHooks<ToolInput>(
   toolName: string,
@@ -4191,6 +4213,11 @@ export async function* executePermissionRequestHooks<ToolInput>(
   })
 }
 
+/**
+ * 配置变更来源类型。
+ *
+ * 场景：ConfigChange hook 用它区分变化来自普通设置、策略设置、技能或命令。
+ */
 export type ConfigChangeSource =
   | 'user_settings'
   | 'project_settings'
@@ -4199,17 +4226,14 @@ export type ConfigChangeSource =
   | 'skills'
 
 /**
- * Execute config change hooks when configuration files change during a session.
- * Fired by file watchers when settings, skills, or commands change on disk.
- * Enables enterprise admins to audit/log configuration changes for security.
+ * 会话中配置文件变化时执行 ConfigChange hook。
  *
- * Policy settings are enterprise-managed and must never be blockable by hooks.
- * Hooks still fire (for audit logging) but blocking results are ignored — callers
- * will always see an empty result for policy sources.
+ * 文件监听器发现 settings、skills 或 commands 变化时触发，用于安全审计或日志记录。
+ * policySettings 属于企业托管配置，不允许被 hook 阻塞；此时 hook 仍会运行，但阻塞结果会被忽略。
  *
- * @param source The type of config that changed
- * @param filePath Optional path to the changed file
- * @param timeoutMs Optional timeout in milliseconds for hook execution
+ * @param source 发生变化的配置来源类型。
+ * @param filePath 变化文件路径，可为空。
+ * @param timeoutMs hook 执行超时，单位毫秒。
  */
 export async function executeConfigChangeHooks(
   source: ConfigChangeSource,
@@ -4229,8 +4253,7 @@ export async function executeConfigChangeHooks(
     matchQuery: source,
   })
 
-  // Policy settings are enterprise-managed — hooks fire for audit logging
-  // but must never block policy changes from being applied
+  // 1. policy_settings 属于企业托管配置，hook 只做审计，不能阻止配置生效。
   if (source === 'policy_settings') {
     return results.map(r => ({ ...r, blocked: false }))
   }
@@ -4238,6 +4261,12 @@ export async function executeConfigChangeHooks(
   return results
 }
 
+/**
+ * 执行环境变化类 hook。
+ *
+ * @param hookInput CwdChanged 或 FileChanged hook 输入。
+ * @returns 非 REPL hook 执行结果列表。
+ */
 async function executeEnvHooks(
   hookInput: HookInput,
   timeoutMs: number,
@@ -4257,6 +4286,13 @@ async function executeEnvHooks(
   return { results, watchPaths, systemMessages }
 }
 
+/**
+ * 当前工作目录变化时触发 CwdChanged hook。
+ *
+ * @param oldCwd 变化前的工作目录。
+ * @param newCwd 变化后的工作目录。
+ * @returns 非 REPL hook 执行结果 Promise。
+ */
 export function executeCwdChangedHooks(
   oldCwd: string,
   newCwd: string,
@@ -4275,6 +4311,12 @@ export function executeCwdChangedHooks(
   return executeEnvHooks(hookInput, timeoutMs)
 }
 
+/**
+ * 文件变化时触发 FileChanged hook。
+ *
+ * @param filePath 发生变化的文件路径。
+ * @returns 非 REPL hook 执行结果 Promise。
+ */
 export function executeFileChangedHooks(
   filePath: string,
   event: 'change' | 'add' | 'unlink',
@@ -4293,6 +4335,11 @@ export function executeFileChangedHooks(
   return executeEnvHooks(hookInput, timeoutMs)
 }
 
+/**
+ * 指令文件加载原因。
+ *
+ * 场景：InstructionsLoaded hook 用它说明文件是启动加载、压缩后加载还是路径触发加载。
+ */
 export type InstructionsLoadReason =
   | 'session_start'
   | 'nested_traversal'
@@ -4300,16 +4347,17 @@ export type InstructionsLoadReason =
   | 'include'
   | 'compact'
 
+/**
+ * 指令记忆来源类型。
+ *
+ * 场景：InstructionsLoaded hook 用它区分用户级、项目级、本地级和托管级指令文件。
+ */
 export type InstructionsMemoryType = 'User' | 'Project' | 'Local' | 'Managed'
 
 /**
- * Check if InstructionsLoaded hooks are configured (without executing them).
- * Callers should check this before invoking executeInstructionsLoadedHooks to avoid
- * building hook inputs for every instruction file when no hook is configured.
+ * 判断是否配置了 InstructionsLoaded hook。
  *
- * Checks both settings-file hooks (getHooksConfigFromSnapshot) and registered
- * hooks (plugin hooks + SDK callback hooks via registerHookCallbacks). Session-
- * derived hooks (structured output enforcement etc.) are internal and not checked.
+ * @returns true 表示存在配置文件或注册表来源的 InstructionsLoaded hook。
  */
 export function hasInstructionsLoadedHook(): boolean {
   const snapshotHooks = getHooksConfigFromSnapshot()?.['InstructionsLoaded']
@@ -4320,17 +4368,16 @@ export function hasInstructionsLoadedHook(): boolean {
 }
 
 /**
- * Execute InstructionsLoaded hooks when an instruction file (CLAUDE.md or
- * .claude/rules/*.md) is loaded into context. Fire-and-forget — this hook is
- * for observability/audit only and does not support blocking.
+ * 指令文件加载到上下文时执行 InstructionsLoaded hook。
  *
- * Dispatch sites:
- * - Eager load at session start (getMemoryFiles in claudemd.ts)
- * - Eager reload after compaction (getMemoryFiles cache cleared by
- *   runPostCompactCleanup; next call reports load_reason: 'compact')
- * - Lazy load when Claude touches a file that triggers nested CLAUDE.md or
- *   conditional rules with paths: frontmatter (memoryFilesToAttachments in
- *   attachments.ts)
+ * 该 hook 用于观测和审计，不支持阻塞。常见触发点包括会话启动加载、压缩后重载、
+ * 以及访问文件时懒加载嵌套 CLAUDE.md 或规则文件。
+ *
+ * @param filePath 被加载的指令文件路径。
+ * @param memoryType 指令来源类型，例如 User、Project、Local 或 Managed。
+ * @param loadReason 加载原因。
+ * @param options 可选上下文，包括匹配 glob、触发文件、父文件和超时。
+ * @returns hook 完成后的 Promise。
  */
 export async function executeInstructionsLoadedHooks(
   filePath: string,
@@ -4368,22 +4415,24 @@ export async function executeInstructionsLoadedHooks(
   })
 }
 
-/** Result of an elicitation hook execution (non-REPL path). */
+/** Elicitation hook 的非 REPL 执行结果。 */
 export type ElicitationHookResult = {
   elicitationResponse?: ElicitationResponse
   blockingError?: HookBlockingError
 }
 
-/** Result of an elicitation-result hook execution (non-REPL path). */
+/** ElicitationResult hook 的非 REPL 执行结果。 */
 export type ElicitationResultHookResult = {
   elicitationResultResponse?: ElicitationResponse
   blockingError?: HookBlockingError
 }
 
 /**
- * Parse elicitation-specific fields from a HookOutsideReplResult.
- * Mirrors the relevant branches of processHookJSONOutput for Elicitation
- * and ElicitationResult hook events.
+ * 从非 REPL hook 结果中提取征询相关字段。
+ *
+ * @param result 非 REPL hook 执行结果。
+ * @param expectedEventName 期望的征询事件名称。
+ * @returns 征询响应或阻塞错误。
  */
 function parseElicitationHookOutput(
   result: HookOutsideReplResult,
@@ -4392,7 +4441,7 @@ function parseElicitationHookOutput(
   response?: ElicitationResponse
   blockingError?: HookBlockingError
 } {
-  // Exit code 2 = blocking (same as executeHooks path)
+  // 1. 退出码 2 表示阻塞，和 executeHooks 路径保持一致。
   if (result.blocked && !result.succeeded) {
     return {
       blockingError: {
@@ -4406,7 +4455,7 @@ function parseElicitationHookOutput(
     return {}
   }
 
-  // Try to parse JSON output for structured elicitation response
+  // 2. 只有 JSON 输出才可能携带结构化征询响应。
   const trimmed = result.output.trim()
   if (!trimmed.startsWith('{')) {
     return {}
@@ -4421,7 +4470,7 @@ function parseElicitationHookOutput(
       return {}
     }
 
-    // Check for top-level decision: 'block' (exit code 0 + JSON block)
+    // 3. 顶层 decision=block 也会转成阻塞错误。
     if (parsed.decision === 'block' || result.blocked) {
       return {
         blockingError: {
@@ -4467,6 +4516,12 @@ function parseElicitationHookOutput(
   }
 }
 
+/**
+ * 执行 Elicitation hook。
+ *
+ * @param param0 MCP 服务名、征询消息、请求 schema、权限模式和展示模式等输入。
+ * @returns 征询 hook 的响应或阻塞错误。
+ */
 export async function executeElicitationHooks({
   serverName,
   message,
@@ -4522,6 +4577,12 @@ export async function executeElicitationHooks({
   return { elicitationResponse, blockingError }
 }
 
+/**
+ * 执行 ElicitationResult hook。
+ *
+ * @param param0 MCP 服务名、用户动作、内容、权限模式和征询 ID 等输入。
+ * @returns 征询结果 hook 的响应或阻塞错误。
+ */
 export async function executeElicitationResultHooks({
   serverName,
   action,
@@ -4575,11 +4636,13 @@ export async function executeElicitationResultHooks({
 }
 
 /**
- * Execute status line command if configured
- * @param statusLineInput The structured status input that will be converted to JSON
- * @param signal Optional AbortSignal to cancel hook execution
- * @param timeoutMs Optional timeout in milliseconds for hook execution
- * @returns The status line text to display, or undefined if no command configured
+ * 执行状态栏命令。
+ *
+ * @param statusLineInput 将序列化为 JSON 的状态栏输入。
+ * @param signal 可选取消信号。
+ * @param timeoutMs 命令超时，单位毫秒。
+ * @param logResult 是否记录执行结果日志。
+ * @returns 要展示的状态栏文本；未配置或失败时返回 undefined。
  */
 export async function executeStatusLineCommand(
   statusLineInput: StatusLineCommandInput,
@@ -4587,13 +4650,12 @@ export async function executeStatusLineCommand(
   timeoutMs: number = 5000, // Short timeout for status line
   logResult: boolean = false,
 ): Promise<string | undefined> {
-  // Check if all hooks (including statusLine) are disabled by managed settings
+  // 1. 托管设置禁用所有 hook 时，状态栏命令也不执行。
   if (shouldDisableAllHooksIncludingManaged()) {
     return undefined
   }
 
-  // SECURITY: ALL hooks require workspace trust in interactive mode
-  // This centralized check prevents RCE vulnerabilities for all current and future hooks
+  // 2. 交互模式下状态栏命令同样必须通过工作区信任检查。
   if (shouldSkipHookDueToTrust()) {
     logForDebugging(
       `Skipping StatusLine command execution - workspace trust not accepted`,
@@ -4601,8 +4663,7 @@ export async function executeStatusLineCommand(
     return undefined
   }
 
-  // When disableAllHooks is set in non-managed settings, only managed statusLine runs
-  // (non-managed settings cannot disable managed commands, but non-managed commands are disabled)
+  // 3. 非托管设置禁用 hook 时，只允许企业托管的 statusLine 继续运行。
   let statusLine
   if (shouldAllowManagedHooksOnly()) {
     statusLine = getSettingsForSource('policySettings')?.statusLine
@@ -4614,11 +4675,11 @@ export async function executeStatusLineCommand(
     return undefined
   }
 
-  // Use provided signal or create a default one
+  // 4. 优先使用外部取消信号，否则按超时创建默认信号。
   const abortSignal = signal || AbortSignal.timeout(timeoutMs)
 
   try {
-    // Convert status input to JSON
+    // 5. 将状态输入序列化为 JSON 后写入命令 stdin。
     const jsonInput = jsonStringify(statusLineInput)
 
     const result = await execCommandHook(
@@ -4634,9 +4695,9 @@ export async function executeStatusLineCommand(
       return undefined
     }
 
-    // For successful hooks (exit code 0), use stdout
+    // 6. 命令成功时使用 stdout 作为状态栏内容。
     if (result.status === 0) {
-      // Trim and split output into lines, then join with newlines
+      // 7. 清理每行空白并移除空行，避免状态栏显示多余换行。
       const output = result.stdout
         .trim()
         .split('\n')
@@ -4666,24 +4727,24 @@ export async function executeStatusLineCommand(
 }
 
 /**
- * Execute file suggestion command if configured
- * @param fileSuggestionInput The structured input that will be converted to JSON
- * @param signal Optional AbortSignal to cancel hook execution
- * @param timeoutMs Optional timeout in milliseconds for hook execution
- * @returns Array of file paths, or empty array if no command configured
+ * 执行文件建议命令。
+ *
+ * @param fileSuggestionInput 将序列化为 JSON 的文件建议输入。
+ * @param signal 可选取消信号。
+ * @param timeoutMs 命令超时，单位毫秒。
+ * @returns 文件路径列表；未配置、失败或取消时返回空数组。
  */
 export async function executeFileSuggestionCommand(
   fileSuggestionInput: FileSuggestionCommandInput,
   signal?: AbortSignal,
   timeoutMs: number = 5000, // Short timeout for typeahead suggestions
 ): Promise<string[]> {
-  // Check if all hooks are disabled by managed settings
+  // 1. 托管设置禁用所有 hook 时，文件建议命令也不执行。
   if (shouldDisableAllHooksIncludingManaged()) {
     return []
   }
 
-  // SECURITY: ALL hooks require workspace trust in interactive mode
-  // This centralized check prevents RCE vulnerabilities for all current and future hooks
+  // 2. 交互模式下文件建议命令同样必须通过工作区信任检查。
   if (shouldSkipHookDueToTrust()) {
     logForDebugging(
       `Skipping FileSuggestion command execution - workspace trust not accepted`,
@@ -4691,8 +4752,7 @@ export async function executeFileSuggestionCommand(
     return []
   }
 
-  // When disableAllHooks is set in non-managed settings, only managed fileSuggestion runs
-  // (non-managed settings cannot disable managed commands, but non-managed commands are disabled)
+  // 3. 非托管设置禁用 hook 时，只允许企业托管的 fileSuggestion 继续运行。
   let fileSuggestion
   if (shouldAllowManagedHooksOnly()) {
     fileSuggestion = getSettingsForSource('policySettings')?.fileSuggestion
@@ -4704,7 +4764,7 @@ export async function executeFileSuggestionCommand(
     return []
   }
 
-  // Use provided signal or create a default one
+  // 4. 优先使用外部取消信号，否则按超时创建默认信号。
   const abortSignal = signal || AbortSignal.timeout(timeoutMs)
 
   try {
@@ -4737,6 +4797,12 @@ export async function executeFileSuggestionCommand(
   }
 }
 
+/**
+ * 执行会话内注册的 function hook。
+ *
+ * @param param0 function hook、消息历史、事件信息、超时和取消信号。
+ * @returns function hook 的统一执行结果。
+ */
 async function executeFunctionHook({
   hook,
   messages,
@@ -4760,7 +4826,7 @@ async function executeFunctionHook({
   })
 
   try {
-    // Check if already aborted
+    // 1. 执行前先检查是否已经被取消，避免启动无意义回调。
     if (abortSignal.aborted) {
       cleanup()
       return {
@@ -4769,13 +4835,13 @@ async function executeFunctionHook({
       }
     }
 
-    // Execute callback with abort signal
+    // 2. 用合并后的 abort 信号执行回调。
     const passed = await new Promise<boolean>((resolve, reject) => {
-      // Handle abort signal
+      // 3. abort 时让 promise 进入拒绝分支，统一走取消处理。
       const onAbort = () => reject(new Error('Function hook cancelled'))
       abortSignal.addEventListener('abort', onAbort)
 
-      // Execute callback
+      // 4. 执行用户回调，并在完成后移除 abort 监听器。
       Promise.resolve(hook.callback(messages, abortSignal))
         .then(result => {
           abortSignal.removeEventListener('abort', onAbort)
@@ -4806,7 +4872,7 @@ async function executeFunctionHook({
   } catch (error) {
     cleanup()
 
-    // Handle cancellation
+    // 5. 取消类错误转换为 cancelled 结果。
     if (
       error instanceof Error &&
       (error.message === 'Function hook cancelled' ||
@@ -4818,7 +4884,7 @@ async function executeFunctionHook({
       }
     }
 
-    // Log for monitoring
+    // 6. 其他异常记录监控日志，并作为非阻塞错误返回。
     logError(error)
     return {
       message: createAttachmentMessage({
@@ -4837,6 +4903,12 @@ async function executeFunctionHook({
   }
 }
 
+/**
+ * 执行 SDK 或内部注册的 callback hook。
+ *
+ * @param param0 callback hook、hook 输入、事件信息、取消信号和可选工具上下文。
+ * @returns callback hook 的统一执行结果。
+ */
 async function executeHookCallback({
   toolUseID,
   hook,
@@ -4854,7 +4926,7 @@ async function executeHookCallback({
   hookIndex?: number
   toolUseContext?: ToolUseContext
 }): Promise<HookResult> {
-  // Create context for callbacks that need state access
+  // 1. 为需要访问应用状态的 callback 构造受限上下文。
   const context = toolUseContext
     ? {
         getAppState: toolUseContext.getAppState,
@@ -4878,12 +4950,12 @@ async function executeHookCallback({
   const processed = processHookJSONOutput({
     json,
     command: 'callback',
-    // TODO: If the hook came from a plugin, use the full path to the plugin for easier debugging
+    // 2. 后续可以在插件来源 callback 中使用插件完整路径增强调试信息。
     hookName: `${hookEvent}:Callback`,
     toolUseID,
     hookEvent,
     expectedHookEvent: hookEvent,
-    // Callbacks don't have stdout/stderr/exitCode
+    // 3. callback hook 没有进程 stdout/stderr/exitCode，传空值即可。
     stdout: undefined,
     stderr: undefined,
     exitCode: undefined,
@@ -4896,23 +4968,18 @@ async function executeHookCallback({
 }
 
 /**
- * Check if WorktreeCreate hooks are configured (without executing them).
+ * 判断是否配置了 WorktreeCreate hook。
  *
- * Checks both settings-file hooks (getHooksConfigFromSnapshot) and registered
- * hooks (plugin hooks + SDK callback hooks via registerHookCallbacks).
+ * 会检查设置快照和注册表来源，但不会真正执行 hook。
  *
- * Must mirror the managedOnly filtering in getHooksConfig() — when
- * shouldAllowManagedHooksOnly() is true, plugin hooks (pluginRoot set) are
- * skipped at execution, so we must also skip them here. Otherwise this returns
- * true but executeWorktreeCreateHook() finds no matching hooks and throws,
- * blocking the git-worktree fallback.
+ * @returns true 表示存在可执行的 WorktreeCreate hook。
  */
 export function hasWorktreeCreateHook(): boolean {
   const snapshotHooks = getHooksConfigFromSnapshot()?.['WorktreeCreate']
   if (snapshotHooks && snapshotHooks.length > 0) return true
   const registeredHooks = getRegisteredHooks()?.['WorktreeCreate']
   if (!registeredHooks || registeredHooks.length === 0) return false
-  // Mirror getHooksConfig(): skip plugin hooks in managed-only mode
+  // 1. 与 getHooksConfig 保持一致：托管模式下跳过插件 hook。
   const managedOnly = shouldAllowManagedHooksOnly()
   return registeredHooks.some(
     matcher => !(managedOnly && 'pluginRoot' in matcher),
@@ -4920,10 +4987,11 @@ export function hasWorktreeCreateHook(): boolean {
 }
 
 /**
- * Execute WorktreeCreate hooks.
- * Returns the worktree path from hook stdout.
- * Throws if hooks fail or produce no output.
- * Callers should check hasWorktreeCreateHook() before calling this.
+ * 执行 WorktreeCreate hook。
+ *
+ * @param name 要创建的 worktree 名称。
+ * @returns hook 输出的 worktree 路径。
+ * @throws 当 hook 全部失败或没有输出路径时抛出错误。
  */
 export async function executeWorktreeCreateHook(
   name: string,
@@ -4939,7 +5007,7 @@ export async function executeWorktreeCreateHook(
     timeoutMs: TOOL_HOOK_EXECUTION_TIMEOUT_MS,
   })
 
-  // Find the first successful result with non-empty output
+  // 1. 取第一个成功且输出非空的结果作为 worktree 路径。
   const successfulResult = results.find(
     r => r.succeeded && r.output.trim().length > 0,
   )
@@ -4958,11 +5026,10 @@ export async function executeWorktreeCreateHook(
 }
 
 /**
- * Execute WorktreeRemove hooks if configured.
- * Returns true if hooks were configured and ran, false if no hooks are configured.
+ * 执行 WorktreeRemove hook。
  *
- * Checks both settings-file hooks (getHooksConfigFromSnapshot) and registered
- * hooks (plugin hooks + SDK callback hooks via registerHookCallbacks).
+ * @param worktreePath 被移除的 worktree 路径。
+ * @returns true 表示存在 hook 且已执行；false 表示没有配置 hook。
  */
 export async function executeWorktreeRemoveHook(
   worktreePath: string,
@@ -5002,6 +5069,12 @@ export async function executeWorktreeRemoveHook(
   return true
 }
 
+/**
+ * 提取 hook 定义摘要供 telemetry 使用。
+ *
+ * @param matchedHooks 已匹配的 hook 列表。
+ * @returns 仅包含类型和关键标识的轻量定义数组。
+ */
 function getHookDefinitionsForTelemetry(
   matchedHooks: MatchedHook[],
 ): Array<{ type: string; command?: string; prompt?: string; name?: string }> {
