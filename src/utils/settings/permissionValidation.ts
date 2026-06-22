@@ -10,50 +10,68 @@ import {
 } from './toolValidationConfig.js'
 
 /**
- * Checks if a character at a given index is escaped (preceded by odd number of backslashes).
+ * 判断指定位置的字符是否处在转义状态。
+ *
+ * @param str 要检查的完整字符串。
+ * @param index 目标字符在字符串中的下标。
+ * @returns true 表示目标字符前面存在奇数个连续反斜杠，因此该字符被转义。
  */
 function isEscaped(str: string, index: number): boolean {
+  // 1. 从目标字符左侧开始，统计连续反斜杠数量。
   let backslashCount = 0
   let j = index - 1
   while (j >= 0 && str[j] === '\\') {
     backslashCount++
     j--
   }
+  // 2. 奇数个反斜杠表示最后一个反斜杠作用在当前字符上。
   return backslashCount % 2 !== 0
 }
 
 /**
- * Counts unescaped occurrences of a character in a string.
- * A character is considered escaped if preceded by an odd number of backslashes.
+ * 统计字符串中未被转义的指定字符数量。
+ *
+ * @param str 要扫描的字符串。
+ * @param char 要统计的单字符目标。
+ * @returns 未被反斜杠转义的目标字符出现次数。
  */
 function countUnescapedChar(str: string, char: string): number {
+  // 1. 逐字符扫描，只有字符相同且不处于转义状态时才计数。
   let count = 0
   for (let i = 0; i < str.length; i++) {
     if (str[i] === char && !isEscaped(str, i)) {
       count++
     }
   }
+  // 2. 返回可参与语法判断的真实字符数量。
   return count
 }
 
 /**
- * Checks if a string contains unescaped empty parentheses "()".
- * Returns true only if both the "(" and ")" are unescaped and adjacent.
+ * 检查权限规则中是否存在未转义的空括号。
+ *
+ * @param str 原始权限规则字符串。
+ * @returns true 表示出现了语义上为空的 `()`，通常说明用户想写模式但漏写了内容。
  */
 function hasUnescapedEmptyParens(str: string): boolean {
+  // 1. 只检查相邻的左右括号，避免把跨内容的括号误判为空括号。
   for (let i = 0; i < str.length - 1; i++) {
     if (str[i] === '(' && str[i + 1] === ')') {
-      // Check if the opening paren is unescaped
+      // 2. 左括号未被转义时，这组括号才属于规则语法。
       if (!isEscaped(str, i)) {
         return true
       }
     }
   }
+  // 3. 没有发现语法层面的空括号。
   return false
 }
 
 /**
- * Validates permission rule format and content
+ * 校验单条权限规则的格式和工具专属内容。
+ *
+ * @param rule 用户配置的权限规则，例如 `Bash(git *)` 或 `Read(src/**)`。
+ * @returns 校验结果；失败时包含错误原因、修复建议和示例。
  */
 export function validatePermissionRule(rule: string): {
   valid: boolean
@@ -61,12 +79,12 @@ export function validatePermissionRule(rule: string): {
   suggestion?: string
   examples?: string[]
 } {
-  // Empty rule check
+  // 1. 空字符串无法表达任何工具或匹配范围，直接返回配置错误。
   if (!rule || rule.trim() === '') {
     return { valid: false, error: 'Permission rule cannot be empty' }
   }
 
-  // Check parentheses matching first (only count unescaped parens)
+  // 2. 先做括号配对检查，避免后续解析把明显不完整的规则当成工具名。
   const openCount = countUnescapedChar(rule, '(')
   const closeCount = countUnescapedChar(rule, ')')
   if (openCount !== closeCount) {
@@ -78,7 +96,7 @@ export function validatePermissionRule(rule: string): {
     }
   }
 
-  // Check for empty parentheses (escape-aware)
+  // 3. 空括号通常是用户误以为 `Tool()` 等价于全量权限，需要给出明确修复方式。
   if (hasUnescapedEmptyParens(rule)) {
     const toolName = rule.substring(0, rule.indexOf('('))
     if (!toolName) {
@@ -96,21 +114,13 @@ export function validatePermissionRule(rule: string): {
     }
   }
 
-  // Parse the rule
+  // 4. 将字符串拆成工具名和可选规则内容；解析器会处理旧工具名和转义括号。
   const parsed = permissionRuleValueFromString(rule)
 
-  // MCP validation - must be done before general tool validation
+  // 5. MCP 工具名不是普通内置工具名，必须先按 MCP 的 server/tool 结构校验。
   const mcpInfo = mcpInfoFromString(parsed.toolName)
   if (mcpInfo) {
-    // MCP rules support server-level, tool-level, and wildcard permissions
-    // Valid formats:
-    // - mcp__server (server-level, all tools)
-    // - mcp__server__* (wildcard, all tools - equivalent to server-level)
-    // - mcp__server__tool (specific tool)
-
-    // MCP rules cannot have any pattern/content (parentheses)
-    // Check both parsed content and raw string since the parser normalizes
-    // standalone wildcards (e.g., "mcp__server(*)") to undefined ruleContent
+    // 6. MCP 权限只支持 server、通配工具或具体工具三种粒度，不支持括号模式。
     if (parsed.ruleContent !== undefined || countUnescapedChar(rule, '(') > 0) {
       return {
         valid: false,
@@ -126,15 +136,16 @@ export function validatePermissionRule(rule: string): {
       }
     }
 
-    return { valid: true } // Valid MCP rule
+    // 7. MCP 工具名结构有效且没有额外模式，规则可接受。
+    return { valid: true }
   }
 
-  // Tool name validation (for non-MCP tools)
+  // 8. 非 MCP 规则必须至少包含工具名。
   if (!parsed.toolName || parsed.toolName.length === 0) {
     return { valid: false, error: 'Tool name cannot be empty' }
   }
 
-  // Check tool name starts with uppercase (standard tools)
+  // 9. 内置工具名按约定首字母大写，提前提示大小写错误。
   if (parsed.toolName[0] !== parsed.toolName[0]?.toUpperCase()) {
     return {
       valid: false,
@@ -143,7 +154,7 @@ export function validatePermissionRule(rule: string): {
     }
   }
 
-  // Check for custom validation rules first
+  // 10. 优先执行工具自己的语义校验，例如 WebFetch 的 domain 前缀规则。
   const customValidation = getCustomValidation(parsed.toolName)
   if (customValidation && parsed.ruleContent !== undefined) {
     const customResult = customValidation(parsed.ruleContent)
@@ -152,11 +163,11 @@ export function validatePermissionRule(rule: string): {
     }
   }
 
-  // Bash-specific validation
+  // 11. Bash 规则同时支持新通配语法和旧 `:*` 前缀语法，需要拦截常见误写。
   if (isBashPrefixTool(parsed.toolName) && parsed.ruleContent !== undefined) {
     const content = parsed.ruleContent
 
-    // Check for common :* mistakes - :* must be at the end (legacy prefix syntax)
+    // 12. 旧前缀语法只能放在末尾，否则匹配语义会变得不明确。
     if (content.includes(':*') && !content.endsWith(':*')) {
       return {
         valid: false,
@@ -170,7 +181,7 @@ export function validatePermissionRule(rule: string): {
       }
     }
 
-    // Check for :* without a prefix
+    // 13. `:*` 前面没有命令前缀时无法形成有效匹配范围。
     if (content === ':*') {
       return {
         valid: false,
@@ -180,27 +191,14 @@ export function validatePermissionRule(rule: string): {
       }
     }
 
-    // Note: We don't validate quote balancing because bash quoting rules are complex.
-    // A command like `grep '"'` has valid unbalanced double quotes.
-    // Users who create patterns with unintended quote mismatches will discover
-    // the issue when matching doesn't work as expected.
-
-    // Wildcards are now allowed at any position for flexible pattern matching
-    // Examples of valid wildcard patterns:
-    // - "npm *" matches "npm install", "npm run test", etc.
-    // - "* install" matches "npm install", "yarn install", etc.
-    // - "git * main" matches "git checkout main", "git push main", etc.
-    // - "npm * --save" matches "npm install foo --save", etc.
-    //
-    // Legacy :* syntax continues to work for backwards compatibility:
-    // - "npm:*" matches "npm" or "npm <anything>" (prefix matching with word boundary)
+    // 14. 不校验 Bash 引号配对；shell 合法写法很多，过度校验会误伤有效命令。
   }
 
-  // File tool validation
+  // 15. 文件类工具使用 glob 思维，和 Bash 的命令前缀匹配需要分开提示。
   if (isFilePatternTool(parsed.toolName) && parsed.ruleContent !== undefined) {
     const content = parsed.ruleContent
 
-    // Check for :* in file patterns (common mistake from Bash patterns)
+    // 16. 文件路径不支持 Bash 的 `:*` 前缀语法，应提示改用 glob。
     if (content.includes(':*')) {
       return {
         valid: false,
@@ -214,14 +212,12 @@ export function validatePermissionRule(rule: string): {
       }
     }
 
-    // Warn about wildcards not at boundaries
+    // 17. 路径通配符放在单词中间通常是误用，给出更符合 glob 直觉的例子。
     if (
       content.includes('*') &&
       !content.match(/^\*|\*$|\*\*|\/\*|\*\.|\*\)/) &&
       !content.includes('**')
     ) {
-      // This is a loose check - wildcards in the middle might be valid in some cases
-      // but often indicate confusion
       return {
         valid: false,
         error: 'Wildcard placement might be incorrect',
@@ -235,16 +231,21 @@ export function validatePermissionRule(rule: string): {
     }
   }
 
+  // 18. 所有通用和工具专属校验都通过，规则可写入配置。
   return { valid: true }
 }
 
 /**
- * Custom Zod schema for permission rule arrays
+ * 权限规则字符串的 Zod 校验器。
+ *
+ * @returns 可复用的 schema；校验失败时会把建议和示例合并进 Zod issue。
  */
 export const PermissionRuleSchema = lazySchema(() =>
   z.string().superRefine((val, ctx) => {
+    // 1. 复用业务校验，保证 settings 解析和手动调用得到一致结果。
     const result = validatePermissionRule(val)
     if (!result.valid) {
+      // 2. 将错误、建议和示例拼成一条面向用户的配置错误信息。
       let message = result.error!
       if (result.suggestion) {
         message += `. ${result.suggestion}`
@@ -258,5 +259,6 @@ export const PermissionRuleSchema = lazySchema(() =>
         params: { received: val },
       })
     }
+    // 3. 校验通过时不添加 issue，交给 Zod 返回原始字符串。
   }),
 )

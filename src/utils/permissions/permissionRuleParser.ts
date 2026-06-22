@@ -4,8 +4,7 @@ import { TASK_OUTPUT_TOOL_NAME } from '../../tools/TaskOutputTool/constants.js'
 import { TASK_STOP_TOOL_NAME } from '../../tools/TaskStopTool/prompt.js'
 import type { PermissionRuleValue } from './PermissionRule.js'
 
-// Dead code elimination: ant-only tool names are conditionally required so
-// their strings don't leak into external builds. Static imports always bundle.
+/** 仅在内部特性打开时才解析 Brief 工具名，避免外部分发包包含内部工具字符串。 */
 /* eslint-disable @typescript-eslint/no-require-imports */
 const BRIEF_TOOL_NAME: string | null =
   feature('KAIROS') || feature('KAIROS_BRIEF')
@@ -15,9 +14,7 @@ const BRIEF_TOOL_NAME: string | null =
     : null
 /* eslint-enable @typescript-eslint/no-require-imports */
 
-// Maps legacy tool names to their current canonical names.
-// When a tool is renamed, add old → new here so permission rules,
-// hooks, and persisted wire names resolve to the canonical name.
+/** 旧工具名到当前规范工具名的映射，用于兼容历史权限规则、Hook matcher 和已持久化的 wire name。 */
 const LEGACY_TOOL_NAME_ALIASES: Record<string, string> = {
   Task: AGENT_TOOL_NAME,
   KillShell: TASK_STOP_TOOL_NAME,
@@ -28,171 +25,182 @@ const LEGACY_TOOL_NAME_ALIASES: Record<string, string> = {
     : {}),
 }
 
+/**
+ * 把历史工具名归一化为当前规范工具名。
+ *
+ * @param name 用户配置、Hook 输入或旧会话中出现的工具名。
+ * @returns 当前代码路径使用的规范工具名；没有别名时返回原值。
+ */
 export function normalizeLegacyToolName(name: string): string {
+  // 1. 优先查别名表，保证重命名后的工具仍能匹配旧配置。
   return LEGACY_TOOL_NAME_ALIASES[name] ?? name
 }
 
+/**
+ * 查询某个规范工具名对应的历史别名。
+ *
+ * @param canonicalName 当前规范工具名。
+ * @returns 所有仍需要兼容的旧工具名列表。
+ */
 export function getLegacyToolNames(canonicalName: string): string[] {
+  // 1. 遍历别名表，反向找出指向当前工具名的旧名称。
   const result: string[] = []
   for (const [legacy, canonical] of Object.entries(LEGACY_TOOL_NAME_ALIASES)) {
     if (canonical === canonicalName) result.push(legacy)
   }
+  // 2. 返回给 matcher 使用，允许旧规则继续命中新工具。
   return result
 }
 
 /**
- * Escapes special characters in rule content for safe storage in permission rules.
- * Permission rules use the format "Tool(content)", so parentheses in content must be escaped.
+ * 转义权限规则内容中的结构字符。
  *
- * Escaping order matters:
- * 1. Escape existing backslashes first (\ -> \\)
- * 2. Then escape parentheses (( -> \(, ) -> \))
+ * 权限规则以 `Tool(content)` 存储，因此内容里的括号必须转义；反斜杠也要先转义，避免后续解析时丢失用户原始输入。
  *
- * @example
- * escapeRuleContent('psycopg2.connect()') // => 'psycopg2.connect\\(\\)'
- * escapeRuleContent('echo "test\\nvalue"') // => 'echo "test\\\\nvalue"'
+ * @param content 规则括号内部的原始内容。
+ * @returns 可安全拼接进 `Tool(...)` 的内容字符串。
  */
 export function escapeRuleContent(content: string): string {
+  // 1. 先转义反斜杠，避免新增的括号转义符被再次处理。
   return content
-    .replace(/\\/g, '\\\\') // Escape backslashes first
-    .replace(/\(/g, '\\(') // Escape opening parentheses
-    .replace(/\)/g, '\\)') // Escape closing parentheses
+    .replace(/\\/g, '\\\\')
+    // 2. 再转义左右括号，保证它们只作为内容而不是规则边界。
+    .replace(/\(/g, '\\(')
+    .replace(/\)/g, '\\)')
 }
 
 /**
- * Unescapes special characters in rule content after parsing from permission rules.
- * This reverses the escaping done by escapeRuleContent.
+ * 还原权限规则内容中的转义字符。
  *
- * Unescaping order matters (reverse of escaping):
- * 1. Unescape parentheses first (\( -> (, \) -> ))
- * 2. Then unescape backslashes (\\ -> \)
- *
- * @example
- * unescapeRuleContent('psycopg2.connect\\(\\)') // => 'psycopg2.connect()'
- * unescapeRuleContent('echo "test\\\\nvalue"') // => 'echo "test\\nvalue"'
+ * @param content 从 `Tool(content)` 中截取出的已转义内容。
+ * @returns 用户配置时表达的原始内容。
  */
 export function unescapeRuleContent(content: string): string {
+  // 1. 先还原括号转义，避免后续处理反斜杠时破坏 `\(` 和 `\)` 的语义。
   return content
-    .replace(/\\\(/g, '(') // Unescape opening parentheses
-    .replace(/\\\)/g, ')') // Unescape closing parentheses
-    .replace(/\\\\/g, '\\') // Unescape backslashes last
+    .replace(/\\\(/g, '(')
+    .replace(/\\\)/g, ')')
+    // 2. 最后还原普通反斜杠。
+    .replace(/\\\\/g, '\\')
 }
 
 /**
- * Parses a permission rule string into its components.
- * Handles escaped parentheses in the content portion.
+ * 把权限规则字符串解析成工具名和可选规则内容。
  *
- * Format: "ToolName" or "ToolName(content)"
- * Content may contain escaped parentheses: \( and \)
- *
- * @example
- * permissionRuleValueFromString('Bash') // => { toolName: 'Bash' }
- * permissionRuleValueFromString('Bash(npm install)') // => { toolName: 'Bash', ruleContent: 'npm install' }
- * permissionRuleValueFromString('Bash(python -c "print\\(1\\)")') // => { toolName: 'Bash', ruleContent: 'python -c "print(1)"' }
+ * @param ruleString 用户配置的规则字符串，支持 `Tool` 和 `Tool(content)` 两种形式。
+ * @returns 结构化权限规则；格式无法可靠解析时会保守地把整段当作工具名。
  */
 export function permissionRuleValueFromString(
   ruleString: string,
 ): PermissionRuleValue {
-  // Find the first unescaped opening parenthesis
+  // 1. 查找第一个未转义左括号，它决定工具名和规则内容的分界。
   const openParenIndex = findFirstUnescapedChar(ruleString, '(')
   if (openParenIndex === -1) {
-    // No parenthesis found - this is just a tool name
+    // 2. 没有括号时表示工具级规则，只需要归一化工具名。
     return { toolName: normalizeLegacyToolName(ruleString) }
   }
 
-  // Find the last unescaped closing parenthesis
+  // 3. 查找最后一个未转义右括号，用于确认内容边界完整。
   const closeParenIndex = findLastUnescapedChar(ruleString, ')')
   if (closeParenIndex === -1 || closeParenIndex <= openParenIndex) {
-    // No matching closing paren or malformed - treat as tool name
+    // 4. 括号不成对时不猜测内容，保守回退为工具名字符串。
     return { toolName: normalizeLegacyToolName(ruleString) }
   }
 
-  // Ensure the closing paren is at the end
+  // 5. 右括号后还有内容说明格式混杂，同样按工具名处理以避免误授权。
   if (closeParenIndex !== ruleString.length - 1) {
-    // Content after closing paren - treat as tool name
     return { toolName: normalizeLegacyToolName(ruleString) }
   }
 
+  // 6. 截取工具名和括号内部原始内容。
   const toolName = ruleString.substring(0, openParenIndex)
   const rawContent = ruleString.substring(openParenIndex + 1, closeParenIndex)
 
-  // Missing toolName (e.g., "(foo)") is malformed - treat whole string as tool name
+  // 7. 缺少工具名时不把括号内容当成权限范围，避免形成意外规则。
   if (!toolName) {
     return { toolName: normalizeLegacyToolName(ruleString) }
   }
 
-  // Empty content (e.g., "Bash()") or standalone wildcard (e.g., "Bash(*)")
-  // should be treated as just the tool name (tool-wide rule)
+  // 8. 空内容和单独 `*` 表示工具级规则，和只写工具名保持一致。
   if (rawContent === '' || rawContent === '*') {
     return { toolName: normalizeLegacyToolName(toolName) }
   }
 
-  // Unescape the content
+  // 9. 还原内容里的转义字符，并返回规范工具名。
   const ruleContent = unescapeRuleContent(rawContent)
   return { toolName: normalizeLegacyToolName(toolName), ruleContent }
 }
 
 /**
- * Converts a permission rule value to its string representation.
- * Escapes parentheses in the content to prevent parsing issues.
+ * 把结构化权限规则序列化为 settings 中使用的字符串。
  *
- * @example
- * permissionRuleValueToString({ toolName: 'Bash' }) // => 'Bash'
- * permissionRuleValueToString({ toolName: 'Bash', ruleContent: 'npm install' }) // => 'Bash(npm install)'
- * permissionRuleValueToString({ toolName: 'Bash', ruleContent: 'python -c "print(1)"' }) // => 'Bash(python -c "print\\(1\\)")'
+ * @param ruleValue 已解析或程序构造出的权限规则。
+ * @returns 可写回配置文件的规则字符串。
  */
 export function permissionRuleValueToString(
   ruleValue: PermissionRuleValue,
 ): string {
+  // 1. 没有内容时保留最短工具级规则写法。
   if (!ruleValue.ruleContent) {
     return ruleValue.toolName
   }
+  // 2. 有内容时先转义结构字符，再拼回 `Tool(content)`。
   const escapedContent = escapeRuleContent(ruleValue.ruleContent)
   return `${ruleValue.toolName}(${escapedContent})`
 }
 
 /**
- * Find the index of the first unescaped occurrence of a character.
- * A character is escaped if preceded by an odd number of backslashes.
+ * 查找字符串中第一个未转义目标字符的位置。
+ *
+ * @param str 要扫描的字符串。
+ * @param char 要查找的单字符目标。
+ * @returns 找到时返回下标，否则返回 -1。
  */
 function findFirstUnescapedChar(str: string, char: string): number {
+  // 1. 从左到右扫描，保证返回的是最早的语法边界。
   for (let i = 0; i < str.length; i++) {
     if (str[i] === char) {
-      // Count preceding backslashes
+      // 2. 统计目标字符左侧连续反斜杠数量。
       let backslashCount = 0
       let j = i - 1
       while (j >= 0 && str[j] === '\\') {
         backslashCount++
         j--
       }
-      // If even number of backslashes, the char is unescaped
+      // 3. 偶数个反斜杠表示目标字符没有被转义。
       if (backslashCount % 2 === 0) {
         return i
       }
     }
   }
+  // 4. 没有可作为语法字符的目标字符。
   return -1
 }
 
 /**
- * Find the index of the last unescaped occurrence of a character.
- * A character is escaped if preceded by an odd number of backslashes.
+ * 查找字符串中最后一个未转义目标字符的位置。
+ *
+ * @param str 要扫描的字符串。
+ * @param char 要查找的单字符目标。
+ * @returns 找到时返回下标，否则返回 -1。
  */
 function findLastUnescapedChar(str: string, char: string): number {
+  // 1. 从右到左扫描，适合寻找规则内容的结束边界。
   for (let i = str.length - 1; i >= 0; i--) {
     if (str[i] === char) {
-      // Count preceding backslashes
+      // 2. 统计目标字符左侧连续反斜杠数量。
       let backslashCount = 0
       let j = i - 1
       while (j >= 0 && str[j] === '\\') {
         backslashCount++
         j--
       }
-      // If even number of backslashes, the char is unescaped
+      // 3. 偶数个反斜杠表示目标字符没有被转义，可以作为语法边界。
       if (backslashCount % 2 === 0) {
         return i
       }
     }
   }
+  // 4. 没有找到未转义的目标字符。
   return -1
 }

@@ -1,25 +1,17 @@
+/** 会话对外暴露的运行状态。 */
 export type SessionState = 'idle' | 'running' | 'requires_action'
 
-/**
- * Context carried with requires_action transitions so downstream
- * surfaces (CCR sidebar, push notifications) can show what the
- * session is blocked on, not just that it's blocked.
- *
- * Two delivery paths:
- * - tool_name + action_description → RequiresActionDetails proto
- *   (webhook payload, typed, logged in Datadog)
- * - full object → external_metadata.pending_action (queryable JSON
- *   on the Session, lets the frontend iterate on shape without
- *   proto round-trips)
- */
+/** 会话进入需要用户处理状态时携带的阻塞详情。 */
 export type RequiresActionDetails = {
+  /** 触发阻塞的工具名。 */
   tool_name: string
-  /** Human-readable summary, e.g. "Editing src/foo.ts", "Running npm test" */
+  /** 面向用户展示的动作摘要，例如正在编辑文件或正在运行命令。 */
   action_description: string
+  /** 工具调用 ID，用于和事件流中的 tool_use 对齐。 */
   tool_use_id: string
+  /** 请求 ID，用于和远端协议或通知链路关联。 */
   request_id: string
-  /** Raw tool input — the frontend reads from external_metadata.pending_action.input
-   * to parse question options / plan content without scanning the event stream. */
+  /** 原始工具输入；前端可据此解析问题选项、计划内容等结构化信息。 */
   input?: Record<string, unknown>
 }
 
@@ -27,103 +19,128 @@ import { isEnvTruthy } from './envUtils.js'
 import type { PermissionMode } from './permissions/PermissionMode.js'
 import { enqueueSdkEvent } from './sdkEventQueue.js'
 
-// CCR external_metadata keys — push in onChangeAppState, restore in
-// externalMetadataToAppState.
+/** 写入 CCR external_metadata 的会话附加信息。 */
 export type SessionExternalMetadata = {
+  /** 当前权限模式。 */
   permission_mode?: string | null
+  /** 是否处于 ultraplan 模式。 */
   is_ultraplan_mode?: boolean | null
+  /** 当前模型标识。 */
   model?: string | null
+  /** 当前阻塞动作；null 表示清除阻塞信息。 */
   pending_action?: RequiresActionDetails | null
-  // Opaque — typed at the emit site. Importing PostTurnSummaryOutput here
-  // would leak the import path string into sdk.d.ts via agentSdkBridge's
-  // re-export of SessionState.
+  /** 回合结束后的摘要，保持 unknown 以避免向 SDK d.ts 泄漏内部类型路径。 */
   post_turn_summary?: unknown
-  // Mid-turn progress line from the forked-agent summarizer — fires every
-  // ~5 steps / 2min so long-running turns still surface "what's happening
-  // right now" before post_turn_summary arrives.
+  /** 长回合中途的任务进度摘要，通常由 forked-agent summarizer 周期性写入。 */
   task_summary?: string | null
 }
 
+/** 会话状态变更监听器。 */
 type SessionStateChangedListener = (
   state: SessionState,
   details?: RequiresActionDetails,
 ) => void
+/** 会话外部元数据变更监听器。 */
 type SessionMetadataChangedListener = (
   metadata: SessionExternalMetadata,
 ) => void
+/** 权限模式变更监听器。 */
 type PermissionModeChangedListener = (mode: PermissionMode) => void
 
+/** 当前注册的会话状态监听器。 */
 let stateListener: SessionStateChangedListener | null = null
+/** 当前注册的元数据监听器。 */
 let metadataListener: SessionMetadataChangedListener | null = null
+/** 当前注册的权限模式监听器。 */
 let permissionModeListener: PermissionModeChangedListener | null = null
 
+/**
+ * 注册或清除会话状态变更监听器。
+ *
+ * @param cb 新监听器；传 null 表示清除监听器。
+ * @returns 无返回值。
+ */
 export function setSessionStateChangedListener(
   cb: SessionStateChangedListener | null,
 ): void {
+  // 1. 监听器只有一个，后注册者覆盖旧注册者。
   stateListener = cb
 }
 
+/**
+ * 注册或清除会话元数据变更监听器。
+ *
+ * @param cb 新监听器；传 null 表示清除监听器。
+ * @returns 无返回值。
+ */
 export function setSessionMetadataChangedListener(
   cb: SessionMetadataChangedListener | null,
 ): void {
+  // 1. CCR 或其他外部桥接层通过该回调接收 metadata patch。
   metadataListener = cb
 }
 
 /**
- * Register a listener for permission-mode changes from onChangeAppState.
- * Wired by print.ts to emit an SDK system:status message so CCR/IDE clients
- * see mode transitions in real time — regardless of which code path mutated
- * toolPermissionContext.mode (Shift+Tab, ExitPlanMode dialog, slash command,
- * bridge set_permission_mode, etc.).
+ * 注册或清除权限模式变更监听器。
+ *
+ * @param cb 新监听器；传 null 表示清除监听器。
+ * @returns 无返回值。
  */
 export function setPermissionModeChangedListener(
   cb: PermissionModeChangedListener | null,
 ): void {
+  // 1. 权限模式所有变更路径最终汇聚到该监听器，避免某个入口漏发状态。
   permissionModeListener = cb
 }
 
+/** 是否已经向 external_metadata 写入 pending_action。 */
 let hasPendingAction = false
+/** 当前会话状态，默认空闲。 */
 let currentState: SessionState = 'idle'
 
+/**
+ * 获取当前会话状态。
+ *
+ * @returns 当前记录的会话状态。
+ */
 export function getSessionState(): SessionState {
+  // 1. 返回模块内的最新状态快照。
   return currentState
 }
 
+/**
+ * 通知会话状态变化，并同步相关外部元数据。
+ *
+ * @param state 新会话状态。
+ * @param details 进入 `requires_action` 时的阻塞详情。
+ * @returns 无返回值。
+ */
 export function notifySessionStateChanged(
   state: SessionState,
   details?: RequiresActionDetails,
 ): void {
+  // 1. 更新本地状态并通知状态监听器。
   currentState = state
   stateListener?.(state, details)
 
-  // Mirror details into external_metadata so GetSession carries the
-  // pending-action context without proto changes. Cleared via RFC 7396
-  // null on the next non-blocked transition.
+  // 2. 进入阻塞态时，把阻塞详情镜像到 external_metadata，便于查询型客户端读取。
   if (state === 'requires_action' && details) {
     hasPendingAction = true
     metadataListener?.({
       pending_action: details,
     })
   } else if (hasPendingAction) {
+    // 3. 离开阻塞态时使用 null patch 清除远端 pending_action。
     hasPendingAction = false
     metadataListener?.({ pending_action: null })
   }
 
-  // task_summary is written mid-turn by the forked summarizer; clear it at
-  // idle so the next turn doesn't briefly show the previous turn's progress.
+  // 4. 回到 idle 时清理中途任务摘要，避免下一回合短暂显示旧进度。
   if (state === 'idle') {
     metadataListener?.({ task_summary: null })
   }
 
-  // Mirror to the SDK event stream so non-CCR consumers (scmuxd, VS Code)
-  // see the same authoritative idle/running signal the CCR bridge does.
-  // 'idle' fires after heldBackResult flushes — lets scmuxd flip IDLE and
-  // show the bg-task dot instead of a stuck generating spinner.
-  //
-  // Opt-in until CCR web + mobile clients learn to ignore this subtype in
-  // their isWorking() last-message heuristics — the trailing idle event
-  // currently pins them at "Running...".
-  // https://anthropic.slack.com/archives/C093BJBD1CP/p1774152406752229
+  // 5. SDK 状态事件默认关闭；开启后把 authoritative 状态同步给非 CCR 客户端。
   if (isEnvTruthy(process.env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS)) {
     enqueueSdkEvent({
       type: 'system',
@@ -133,18 +150,26 @@ export function notifySessionStateChanged(
   }
 }
 
+/**
+ * 通知会话外部元数据变化。
+ *
+ * @param metadata 要合并到 external_metadata 的局部对象。
+ * @returns 无返回值。
+ */
 export function notifySessionMetadataChanged(
   metadata: SessionExternalMetadata,
 ): void {
+  // 1. 元数据更新只通过监听器转发，具体持久化由桥接层决定。
   metadataListener?.(metadata)
 }
 
 /**
- * Fired by onChangeAppState when toolPermissionContext.mode changes.
- * Downstream listeners (CCR external_metadata PUT, SDK status stream) are
- * both wired through this single choke point so no mode-mutation path can
- * silently bypass them.
+ * 通知权限模式变化。
+ *
+ * @param mode 新的权限模式。
+ * @returns 无返回值。
  */
 export function notifyPermissionModeChanged(mode: PermissionMode): void {
+  // 1. 下游会把该变化同步到 CCR external_metadata 和 SDK status stream。
   permissionModeListener?.(mode)
 }
