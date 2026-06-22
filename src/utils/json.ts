@@ -34,12 +34,12 @@ function parseJSONUncached(
     if (shouldLogError) {
       logError(e)
     }
-    // 3. 用 ok=false 表示失败，和 JSON 文本 `null` 区分开。
+    // 3. 用失败标记表示解析失败，和 JSON 文本 `null` 区分开。
     return { ok: false }
   }
 }
 
-/** 小输入的 LRU JSON 解析缓存；缓存失败结果可避免重复解析同一段坏 JSON。 */
+/** 小输入的最近最少使用 JSON 解析缓存；缓存失败结果可避免重复解析同一段坏 JSON。 */
 const parseJSONCached = memoizeWithLRU(parseJSONUncached, json => json, 50)
 
 /**
@@ -56,7 +56,7 @@ export const safeParseJSON = Object.assign(
   ): unknown {
     // 1. 空输入按无数据处理，和历史调用约定保持一致。
     if (!json) return null
-    // 2. 大文本不进入 LRU，避免把完整配置或日志内容固定在缓存 key 中。
+    // 2. 大文本不进入缓存，避免把完整配置或日志内容固定在缓存键中。
     const result =
       json.length > PARSE_CACHE_MAX_KEY_BYTES
         ? parseJSONUncached(json, shouldLogError)
@@ -79,7 +79,7 @@ export function safeParseJSONC(json: string | null | undefined): unknown {
     return null
   }
   try {
-    // 2. 先去掉 PowerShell 等工具可能写入的 UTF-8 BOM，再解析 JSONC。
+    // 2. 先去掉命令行工具可能写入的 UTF-8 字节序标记，再解析 JSONC。
     return parseJsonc(stripBOM(json))
   } catch (e) {
     // 3. JSONC 解析失败属于配置问题，记录后以 null 降级。
@@ -98,7 +98,7 @@ type BunJSONLParseChunk = (
 const bunJSONLParse: BunJSONLParseChunk | false = (() => {
   // 1. 非 Bun 环境没有 Bun.JSONL，直接使用兼容解析器。
   if (typeof Bun === 'undefined') return false
-  // 2. 运行时检查 parseChunk，避免类型假设导致启动失败。
+  // 2. 运行时检查分块解析入口，避免类型假设导致启动失败。
   const b = Bun as Record<string, unknown>
   const jsonl = b.JSONL as Record<string, unknown> | undefined
   if (!jsonl?.parseChunk) return false
@@ -186,7 +186,7 @@ function parseJSONLString<T>(data: string): T[] {
   const len = stripped.length
   let start = 0
 
-  // 2. 避免 split 产生大量中间数组，直接用 indexOf 逐段解析。
+  // 2. 避免整段切分产生大量中间数组，直接按换行位置逐段解析。
   const results: T[] = []
   while (start < len) {
     let end = stripped.indexOf('\n', start)
@@ -219,7 +219,7 @@ export function parseJSONL<T>(data: string | Buffer): T[] {
   if (typeof data === 'string') {
     return parseJSONLString<T>(data)
   }
-  // 3. Buffer 输入保持 Buffer 路径，避免先整体转字符串。
+  // 3. 二进制输入保持二进制路径，避免先整体转字符串。
   return parseJSONLBuffer<T>(data)
 }
 
@@ -276,7 +276,7 @@ export function addItemToJSONCArray(content: string, newItem: unknown): string {
       return jsonStringify([newItem], null, 4)
     }
 
-    // 2. 去掉 BOM，避免 JSONC parser 把 BOM 当成内容处理。
+    // 2. 去掉字节序标记，避免 JSONC 解析器把标记当成内容处理。
     const cleanContent = stripBOM(content)
 
     // 3. 先解析确认顶层结构，只有数组才适合做保留注释的增量编辑。
@@ -288,7 +288,7 @@ export function addItemToJSONCArray(content: string, newItem: unknown): string {
       const isEmpty = arrayLength === 0
       const insertPath = isEmpty ? [0] : [arrayLength]
 
-      // 5. 使用 jsonc-parser 生成编辑，最大限度保留原注释和排版。
+      // 5. 使用 JSONC 编辑器生成变更，最大限度保留原注释和排版。
       const edits = modify(cleanContent, insertPath, newItem, {
         formattingOptions: { insertSpaces: true, tabSize: 4 },
         isArrayInsertion: true,

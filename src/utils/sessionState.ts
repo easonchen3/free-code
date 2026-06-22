@@ -7,7 +7,7 @@ export type RequiresActionDetails = {
   tool_name: string
   /** 面向用户展示的动作摘要，例如正在编辑文件或正在运行命令。 */
   action_description: string
-  /** 工具调用 ID，用于和事件流中的 tool_use 对齐。 */
+  /** 工具调用 ID，用于和事件流中的工具调用事件对齐。 */
   tool_use_id: string
   /** 请求 ID，用于和远端协议或通知链路关联。 */
   request_id: string
@@ -19,7 +19,7 @@ import { isEnvTruthy } from './envUtils.js'
 import type { PermissionMode } from './permissions/PermissionMode.js'
 import { enqueueSdkEvent } from './sdkEventQueue.js'
 
-/** 写入 CCR external_metadata 的会话附加信息。 */
+/** 写入 CCR 外部元数据字段的会话附加信息。 */
 export type SessionExternalMetadata = {
   /** 当前权限模式。 */
   permission_mode?: string | null
@@ -29,9 +29,9 @@ export type SessionExternalMetadata = {
   model?: string | null
   /** 当前阻塞动作；null 表示清除阻塞信息。 */
   pending_action?: RequiresActionDetails | null
-  /** 回合结束后的摘要，保持 unknown 以避免向 SDK d.ts 泄漏内部类型路径。 */
+  /** 回合结束后的摘要，保持未知类型以避免向 SDK 类型声明泄漏内部类型路径。 */
   post_turn_summary?: unknown
-  /** 长回合中途的任务进度摘要，通常由 forked-agent summarizer 周期性写入。 */
+  /** 长回合中途的任务进度摘要，通常由后台代理摘要器周期性写入。 */
   task_summary?: string | null
 }
 
@@ -76,7 +76,7 @@ export function setSessionStateChangedListener(
 export function setSessionMetadataChangedListener(
   cb: SessionMetadataChangedListener | null,
 ): void {
-  // 1. CCR 或其他外部桥接层通过该回调接收 metadata patch。
+  // 1. CCR 或其他外部桥接层通过该回调接收元数据增量。
   metadataListener = cb
 }
 
@@ -93,7 +93,7 @@ export function setPermissionModeChangedListener(
   permissionModeListener = cb
 }
 
-/** 是否已经向 external_metadata 写入 pending_action。 */
+/** 是否已经向外部元数据写入待处理动作。 */
 let hasPendingAction = false
 /** 当前会话状态，默认空闲。 */
 let currentState: SessionState = 'idle'
@@ -123,14 +123,14 @@ export function notifySessionStateChanged(
   currentState = state
   stateListener?.(state, details)
 
-  // 2. 进入阻塞态时，把阻塞详情镜像到 external_metadata，便于查询型客户端读取。
+  // 2. 进入阻塞态时，把阻塞详情镜像到外部元数据，便于查询型客户端读取。
   if (state === 'requires_action' && details) {
     hasPendingAction = true
     metadataListener?.({
       pending_action: details,
     })
   } else if (hasPendingAction) {
-    // 3. 离开阻塞态时使用 null patch 清除远端 pending_action。
+    // 3. 离开阻塞态时使用空增量清除远端待处理动作。
     hasPendingAction = false
     metadataListener?.({ pending_action: null })
   }
@@ -140,7 +140,7 @@ export function notifySessionStateChanged(
     metadataListener?.({ task_summary: null })
   }
 
-  // 5. SDK 状态事件默认关闭；开启后把 authoritative 状态同步给非 CCR 客户端。
+  // 5. SDK 状态事件默认关闭；开启后把权威状态同步给非 CCR 客户端。
   if (isEnvTruthy(process.env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS)) {
     enqueueSdkEvent({
       type: 'system',
@@ -153,7 +153,7 @@ export function notifySessionStateChanged(
 /**
  * 通知会话外部元数据变化。
  *
- * @param metadata 要合并到 external_metadata 的局部对象。
+ * @param metadata 要合并到外部元数据字段的局部对象。
  * @returns 无返回值。
  */
 export function notifySessionMetadataChanged(
@@ -170,6 +170,6 @@ export function notifySessionMetadataChanged(
  * @returns 无返回值。
  */
 export function notifyPermissionModeChanged(mode: PermissionMode): void {
-  // 1. 下游会把该变化同步到 CCR external_metadata 和 SDK status stream。
+  // 1. 下游会把该变化同步到 CCR 外部元数据和 SDK 状态事件流。
   permissionModeListener?.(mode)
 }

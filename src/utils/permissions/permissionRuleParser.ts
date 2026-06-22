@@ -5,6 +5,7 @@ import { TASK_STOP_TOOL_NAME } from '../../tools/TaskStopTool/prompt.js'
 import type { PermissionRuleValue } from './PermissionRule.js'
 
 /** 仅在内部特性打开时才解析 Brief 工具名，避免外部分发包包含内部工具字符串。 */
+/** 下面两行是静态检查工具指令，必须保留原格式；这里临时允许按特性开关动态加载内部工具。 */
 /* eslint-disable @typescript-eslint/no-require-imports */
 const BRIEF_TOOL_NAME: string | null =
   feature('KAIROS') || feature('KAIROS_BRIEF')
@@ -14,7 +15,7 @@ const BRIEF_TOOL_NAME: string | null =
     : null
 /* eslint-enable @typescript-eslint/no-require-imports */
 
-/** 旧工具名到当前规范工具名的映射，用于兼容历史权限规则、Hook matcher 和已持久化的 wire name。 */
+/** 旧工具名到当前规范工具名的映射，用于兼容历史权限规则、钩子匹配器和已持久化的传输层名称。 */
 const LEGACY_TOOL_NAME_ALIASES: Record<string, string> = {
   Task: AGENT_TOOL_NAME,
   KillShell: TASK_STOP_TOOL_NAME,
@@ -28,7 +29,7 @@ const LEGACY_TOOL_NAME_ALIASES: Record<string, string> = {
 /**
  * 把历史工具名归一化为当前规范工具名。
  *
- * @param name 用户配置、Hook 输入或旧会话中出现的工具名。
+ * @param name 用户配置、钩子输入或旧会话中出现的工具名。
  * @returns 当前代码路径使用的规范工具名；没有别名时返回原值。
  */
 export function normalizeLegacyToolName(name: string): string {
@@ -48,7 +49,7 @@ export function getLegacyToolNames(canonicalName: string): string[] {
   for (const [legacy, canonical] of Object.entries(LEGACY_TOOL_NAME_ALIASES)) {
     if (canonical === canonicalName) result.push(legacy)
   }
-  // 2. 返回给 matcher 使用，允许旧规则继续命中新工具。
+  // 2. 返回给匹配器使用，允许旧规则继续命中新工具。
   return result
 }
 
@@ -132,7 +133,7 @@ export function permissionRuleValueFromString(
 }
 
 /**
- * 把结构化权限规则序列化为 settings 中使用的字符串。
+ * 把结构化权限规则序列化为配置文件中使用的字符串。
  *
  * @param ruleValue 已解析或程序构造出的权限规则。
  * @returns 可写回配置文件的规则字符串。

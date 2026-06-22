@@ -17,7 +17,7 @@ export const SUPPORTED_PLATFORMS: Platform[] = ['macos', 'wsl']
  */
 export const getPlatform = memoize((): Platform => {
   try {
-    // 1. Node 的平台字段能直接识别 macOS 和 Windows。
+  // 1. 运行时的平台字段能直接识别苹果系统和 Windows。
     if (process.platform === 'darwin') {
       return 'macos'
     }
@@ -26,14 +26,14 @@ export const getPlatform = memoize((): Platform => {
       return 'windows'
     }
 
-    // 2. Linux 需要进一步区分普通 Linux 和 WSL。
+    // 2. Linux 需要进一步区分普通发行版和 Windows 子系统环境。
     if (process.platform === 'linux') {
       try {
         const procVersion = getFsImplementation().readFileSync(
           '/proc/version',
           { encoding: 'utf8' },
         )
-        // 3. WSL 的内核版本通常带有 Microsoft 或 WSL 标记。
+        // 3. Windows 子系统环境的内核版本通常带有微软或子系统标记。
         if (
           procVersion.toLowerCase().includes('microsoft') ||
           procVersion.toLowerCase().includes('wsl')
@@ -45,11 +45,11 @@ export const getPlatform = memoize((): Platform => {
         logError(error)
       }
 
-      // 5. 没有 WSL 特征时归类为普通 Linux。
+      // 5. 没有 Windows 子系统特征时归类为普通 Linux。
       return 'linux'
     }
 
-    // 6. 其他 Node 平台暂不做细分。
+    // 6. 其他运行时平台暂不做细分。
     return 'unknown'
   } catch (error) {
     // 7. 平台探测不应影响主流程，异常时降级为 unknown。
@@ -59,33 +59,33 @@ export const getPlatform = memoize((): Platform => {
 })
 
 /**
- * 获取 WSL 主版本号。
+ * 获取 Windows 子系统环境的主版本号。
  *
- * @returns WSL 版本号字符串；非 Linux、非 WSL 或无法判断时返回 undefined。
+ * @returns 子系统版本号字符串；非 Linux、非子系统环境或无法判断时返回 undefined。
  */
 export const getWslVersion = memoize((): string | undefined => {
-  // 1. 只有 Linux 平台可能是 WSL，其他平台直接跳过文件读取。
+  // 1. 只有 Linux 平台可能是 Windows 子系统环境，其他平台直接跳过文件读取。
   if (process.platform !== 'linux') {
     return undefined
   }
   try {
-    // 2. 从内核版本字符串中寻找 WSL 标记。
+    // 2. 从内核版本字符串中寻找子系统标记。
     const procVersion = getFsImplementation().readFileSync('/proc/version', {
       encoding: 'utf8',
     })
 
-    // 3. 新版 WSL 通常会显式写出 WSL2、WSL3 等版本号。
+    // 3. 新版子系统通常会显式写出第二代、第三代等版本号。
     const wslVersionMatch = procVersion.match(/WSL(\d+)/i)
     if (wslVersionMatch && wslVersionMatch[1]) {
       return wslVersionMatch[1]
     }
 
-    // 4. 旧版 WSL1 常见格式只包含 Microsoft，不包含 WSL 数字。
+    // 4. 旧版第一代子系统常见格式只包含微软标记，不包含数字版本。
     if (procVersion.toLowerCase().includes('microsoft')) {
       return '1'
     }
 
-    // 5. 没有任何 WSL 特征时返回 undefined。
+    // 5. 没有任何子系统特征时返回 undefined。
     return undefined
   } catch (error) {
     // 6. 探测失败不阻断主流程，只记录并返回未知。
@@ -116,7 +116,7 @@ export const getLinuxDistroInfo = memoize(
       return undefined
     }
 
-    // 2. 内核版本可直接从 Node OS API 获取，发行版字段再从文件补充。
+    // 2. 内核版本可直接从运行时系统接口获取，发行版字段再从文件补充。
     const result: LinuxDistroInfo = {
       linuxKernel: osRelease(),
     }
@@ -160,10 +160,10 @@ const VCS_MARKERS: Array<[string, string]> = [
  * 检测指定目录中可见的版本控制系统。
  *
  * @param dir 要检查的目录；未传时使用当前文件系统工作目录。
- * @returns 检测到的 VCS 名称列表，去重后返回。
+ * @returns 检测到的版本控制系统名称列表，去重后返回。
  */
 export async function detectVcs(dir?: string): Promise<string[]> {
-  // 1. 使用 Set 去重，因为环境变量和目录标记可能同时指向同一种 VCS。
+  // 1. 使用集合去重，因为环境变量和目录标记可能同时指向同一种版本控制系统。
   const detected = new Set<string>()
 
   // 2. Perforce 常通过环境变量配置，不一定有本地目录标记。
@@ -172,7 +172,7 @@ export async function detectVcs(dir?: string): Promise<string[]> {
   }
 
   try {
-    // 3. 读取目标目录的第一层条目，并匹配常见 VCS 标记文件或目录。
+    // 3. 读取目标目录的第一层条目，并匹配常见版本控制系统标记文件或目录。
     const targetDir = dir ?? getFsImplementation().cwd()
     const entries = new Set(await readdir(targetDir))
     for (const [marker, vcs] of VCS_MARKERS) {

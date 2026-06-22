@@ -1,8 +1,8 @@
 /**
  * 同步文件读取的轻量实现。
  *
- * 这个文件从 `file.ts` 中拆出纯读取路径，避免 settings 等底层模块为了同步读文件而引入日志、命令、工具注册等较重依赖链。
- * 这里仅依赖文件系统抽象和 debug 日志；带错误日志包装的编码/换行检测仍保留在 `file.ts`。
+ * 这个文件从 `file.ts` 中拆出纯读取路径，避免配置等底层模块为了同步读文件而引入日志、命令、工具注册等较重依赖链。
+ * 这里仅依赖文件系统抽象和调试日志；带错误日志包装的编码和换行检测仍保留在 `file.ts`。
  */
 
 import { logForDebugging } from './debug.js'
@@ -15,7 +15,7 @@ export type LineEndingType = 'CRLF' | 'LF'
  * 基于已解析路径探测文件编码。
  *
  * @param resolvedPath 已经过安全解析的真实文件路径。
- * @returns 文件读取应使用的 Node Buffer 编码。
+ * @returns 文件读取应使用的二进制文本编码。
  */
 export function detectEncodingForResolvedPath(
   resolvedPath: string,
@@ -25,7 +25,7 @@ export function detectEncodingForResolvedPath(
     length: 4096,
   })
 
-  // 2. 空文件默认按 UTF-8 处理，后续写入中文或 emoji 时不会被 ASCII 语义污染。
+  // 2. 空文件默认按 UTF-8 处理，后续写入中文或扩展字符时不会被窄字符语义污染。
   if (bytesRead === 0) {
     return 'utf8'
   }
@@ -90,7 +90,7 @@ export function readFileSyncWithMetadata(filePath: string): {
   const fs = getFsImplementation()
   const { resolvedPath, isSymlink } = safeResolvePath(fs, filePath)
 
-  // 2. 符号链接读取只写 debug，避免把正常链接访问当成错误。
+  // 2. 符号链接读取只写调试日志，避免把正常链接访问当成错误。
   if (isSymlink) {
     logForDebugging(`Reading through symlink: ${filePath} -> ${resolvedPath}`)
   }

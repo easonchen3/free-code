@@ -6,13 +6,13 @@
 
 /** 权限规则校验器使用的工具分类和自定义校验函数集合。 */
 export type ToolValidationConfig = {
-  /** 接收文件 glob 模式的工具，例如 `*.ts`、`src/**`。 */
+  /** 接收文件通配模式的工具，例如 `*.ts`、`src/**`。 */
   filePatternTools: string[]
 
-  /** 接收 Bash 命令通配模式的工具，支持任意位置 `*` 和历史 `:*` 前缀语法。 */
+  /** 接收命令行通配模式的工具，支持任意位置 `*` 和历史 `:*` 前缀语法。 */
   bashPrefixTools: string[]
 
-  /** 按工具名注册的内容校验函数，用于表达 WebFetch 这类工具的专属规则。 */
+  /** 按工具名注册的内容校验函数，用于表达网页抓取这类工具的专属规则。 */
   customValidation: {
     [toolName: string]: (content: string) => {
       valid: boolean
@@ -25,7 +25,7 @@ export type ToolValidationConfig = {
 
 /** 内置工具权限规则内容的分类配置和专属校验入口。 */
 export const TOOL_VALIDATION_CONFIG: ToolValidationConfig = {
-  // 1. 这些工具的规则内容按文件路径或 glob 解释。
+  // 1. 这些工具的规则内容按文件路径或通配模式解释。
   filePatternTools: [
     'Read',
     'Write',
@@ -35,19 +35,19 @@ export const TOOL_VALIDATION_CONFIG: ToolValidationConfig = {
     'NotebookEdit',
   ],
 
-  // 2. Bash 的规则内容按命令模式解释，兼容旧的 `command:*` 写法。
+  // 2. 命令行工具的规则内容按命令模式解释，兼容旧的 `command:*` 写法。
   bashPrefixTools: ['Bash'],
 
   // 3. 只有内容语义无法靠通用分类表达时，才在这里补工具专属校验。
   customValidation: {
     /**
-     * 校验 WebSearch 的搜索词权限规则。
+     * 校验网页搜索工具的搜索词权限规则。
      *
-     * @param content WebSearch 括号中的搜索词。
-     * @returns 校验结果；WebSearch 不支持通配符，因此包含 `*` 或 `?` 时返回错误。
+     * @param content 网页搜索工具括号中的搜索词。
+     * @returns 校验结果；网页搜索工具不支持通配符，因此包含 `*` 或 `?` 时返回错误。
      */
     WebSearch: content => {
-      // 1. WebSearch 权限按搜索词精确匹配，不支持 glob 或 shell 风格通配符。
+      // 1. 网页搜索权限按搜索词精确匹配，不支持文件通配或命令行风格通配符。
       if (content.includes('*') || content.includes('?')) {
         return {
           valid: false,
@@ -61,13 +61,13 @@ export const TOOL_VALIDATION_CONFIG: ToolValidationConfig = {
     },
 
     /**
-     * 校验 WebFetch 的域名权限规则。
+     * 校验网页抓取工具的域名权限规则。
      *
-     * @param content WebFetch 括号中的域名规则。
+     * @param content 网页抓取工具括号中的域名规则。
      * @returns 校验结果；合法内容必须使用 `domain:` 前缀。
      */
     WebFetch: content => {
-      // 1. WebFetch 权限只接受域名模式，不能直接写 URL。
+      // 1. 网页抓取权限只接受域名模式，不能直接写网址。
       if (content.includes('://') || content.startsWith('http')) {
         return {
           valid: false,
@@ -100,7 +100,7 @@ export const TOOL_VALIDATION_CONFIG: ToolValidationConfig = {
 }
 
 /**
- * 判断工具的权限规则内容是否应按文件 glob 解释。
+ * 判断工具的权限规则内容是否应按文件通配模式解释。
  *
  * @param toolName 工具名。
  * @returns true 表示该工具使用文件模式校验。
@@ -111,13 +111,13 @@ export function isFilePatternTool(toolName: string): boolean {
 }
 
 /**
- * 判断工具的权限规则内容是否应按 Bash 命令模式解释。
+ * 判断工具的权限规则内容是否应按命令行命令模式解释。
  *
  * @param toolName 工具名。
- * @returns true 表示该工具支持 Bash 通配和历史前缀语法。
+ * @returns true 表示该工具支持命令行通配和历史前缀语法。
  */
 export function isBashPrefixTool(toolName: string): boolean {
-  // 1. Bash 类工具单独分类，避免把命令模式误套到文件路径上。
+  // 1. 命令行类工具单独分类，避免把命令模式误套到文件路径上。
   return TOOL_VALIDATION_CONFIG.bashPrefixTools.includes(toolName)
 }
 

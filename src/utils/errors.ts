@@ -1,6 +1,6 @@
 import { APIUserAbortError } from '@anthropic-ai/sdk'
 
-/** 产品内部通用错误基类；构造时把 name 固定为具体子类名，便于日志和 UI 展示。 */
+/** 产品内部通用错误基类；构造时把错误名称固定为具体子类名，便于日志和界面展示。 */
 export class ClaudeError extends Error {
   /**
    * 创建 Claude 业务错误。
@@ -8,9 +8,9 @@ export class ClaudeError extends Error {
    * @param message 面向调用方展示或记录的错误消息。
    */
   constructor(message: string) {
-    // 1. 先交给 Error 保存 message 和 stack。
+    // 1. 先交给标准错误基类保存消息和堆栈。
     super(message)
-    // 2. 再使用实际构造函数名覆盖 name，避免统一显示为 Error。
+    // 2. 再使用实际构造函数名覆盖错误名称，避免统一显示为普通错误。
     this.name = this.constructor.name
   }
 }
@@ -18,7 +18,7 @@ export class ClaudeError extends Error {
 /** 命令定义或调用格式不合法时抛出的错误。 */
 export class MalformedCommandError extends Error {}
 
-/** 本地可识别的取消错误，用于和 DOM AbortError、SDK abort 错误统一判断。 */
+/** 本地可识别的取消错误，用于和浏览器中断错误、SDK 中断错误统一判断。 */
 export class AbortError extends Error {
   /**
    * 创建取消错误。
@@ -28,7 +28,7 @@ export class AbortError extends Error {
   constructor(message?: string) {
     // 1. 保存取消原因。
     super(message)
-    // 2. 使用标准 AbortError 名称，方便跨模块按 name 识别。
+    // 2. 使用标准中断错误名称，方便跨模块按错误名称识别。
     this.name = 'AbortError'
   }
 }
@@ -40,7 +40,7 @@ export class AbortError extends Error {
  * @returns true 表示该错误属于取消流程，通常不应按失败上报。
  */
 export function isAbortError(e: unknown): boolean {
-  // 1. 同时兼容本地 AbortError、SDK APIUserAbortError 和 DOM AbortError。
+  // 1. 同时兼容本地中断错误、SDK 用户中断错误和浏览器中断错误。
   return (
     e instanceof AbortError ||
     e instanceof APIUserAbortError ||
@@ -73,10 +73,10 @@ export class ConfigParseError extends Error {
   }
 }
 
-/** Shell 命令执行失败时的结构化错误，保留 stdout、stderr、退出码和中断状态。 */
+/** 命令行执行失败时的结构化错误，保留标准输出、标准错误、退出码和中断状态。 */
 export class ShellError extends Error {
   /**
-   * 创建 Shell 执行错误。
+   * 创建命令行执行错误。
    *
    * @param stdout 命令标准输出。
    * @param stderr 命令标准错误。
@@ -91,7 +91,7 @@ export class ShellError extends Error {
   ) {
     // 1. 对外使用统一的错误消息，详细内容放在只读字段中。
     super('Shell command failed')
-    // 2. 固定错误名，便于调用方 instanceof 之外的展示逻辑识别。
+    // 2. 固定错误名，便于调用方在类型判断之外做展示逻辑识别。
     this.name = 'ShellError'
   }
 }
@@ -108,9 +108,9 @@ export class TeleportOperationError extends Error {
     message: string,
     public readonly formattedMessage: string,
   ) {
-    // 1. 原始 message 进入 Error 基类。
+    // 1. 原始消息进入标准错误基类。
     super(message)
-    // 2. 使用业务错误名，避免只显示为普通 Error。
+    // 2. 使用业务错误名，避免只显示为普通错误。
     this.name = 'TeleportOperationError'
   }
 }
@@ -118,7 +118,7 @@ export class TeleportOperationError extends Error {
 /**
  * 可安全写入遥测的错误。
  *
- * 类名刻意很长，用来提醒调用方：传入 telemetryMessage 前必须确认其中不包含路径、URL、代码片段等敏感内容。
+ * 类名刻意很长，用来提醒调用方：传入遥测消息前必须确认其中不包含路径、网址、代码片段等敏感内容。
  */
 export class TelemetrySafeError_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS extends Error {
   /** 专门用于遥测的脱敏消息。 */
@@ -133,7 +133,7 @@ export class TelemetrySafeError_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS extends
   constructor(message: string, telemetryMessage?: string) {
     // 1. 保存完整错误消息。
     super(message)
-    // 2. 使用较短 name，避免日志里重复超长类名。
+    // 2. 使用较短错误名，避免日志里重复超长类名。
     this.name = 'TelemetrySafeError'
     // 3. 遥测消息可与用户消息分离，支持本地详细、远端脱敏。
     this.telemetryMessage = telemetryMessage ?? message
@@ -141,25 +141,25 @@ export class TelemetrySafeError_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS extends
 }
 
 /**
- * 判断未知错误是否具有指定的精确 message。
+ * 判断未知错误是否具有指定的精确消息。
  *
  * @param error 捕获到的未知错误值。
  * @param message 需要比较的完整错误消息。
- * @returns true 表示 error 是 Error 且 message 完全一致。
+ * @returns true 表示输入值是错误对象且消息完全一致。
  */
 export function hasExactErrorMessage(error: unknown, message: string): boolean {
-  // 1. 只对真正的 Error 做精确消息比较。
+  // 1. 只对真正的错误对象做精确消息比较。
   return error instanceof Error && error.message === message
 }
 
 /**
- * 把未知异常值标准化成 Error 实例。
+ * 把未知异常值标准化成错误实例。
  *
  * @param e catch 块捕获到的任意值。
- * @returns Error 实例；非 Error 值会用 String 转成 message。
+ * @returns 错误实例；非错误值会转成字符串消息。
  */
 export function toError(e: unknown): Error {
-  // 1. 保留原 Error 的 stack 和类型；其他值包装成普通 Error。
+  // 1. 保留原错误对象的堆栈和类型；其他值包装成普通错误。
   return e instanceof Error ? e : new Error(String(e))
 }
 
@@ -167,25 +167,25 @@ export function toError(e: unknown): Error {
  * 从未知异常值中提取可读消息。
  *
  * @param e catch 块捕获到的任意值。
- * @returns Error.message 或 String(e)。
+ * @returns 错误消息；非错误值返回字符串化结果。
  */
 export function errorMessage(e: unknown): string {
-  // 1. Error 使用 message，非 Error 仍给出字符串表示。
+  // 1. 错误对象使用自身消息，非错误值仍给出字符串表示。
   return e instanceof Error ? e.message : String(e)
 }
 
 /**
- * 读取 Node 文件系统错误的 errno code。
+ * 读取运行时文件系统错误的错误码。
  *
  * @param e 捕获到的未知错误值。
- * @returns 例如 `ENOENT`、`EACCES` 的 code；不存在时返回 undefined。
+ * @returns 例如 `ENOENT`、`EACCES` 的错误码；不存在时返回 undefined。
  */
 export function getErrnoCode(e: unknown): string | undefined {
   // 1. 用结构检查替代强制类型断言，避免非对象错误抛出二次异常。
   if (e && typeof e === 'object' && 'code' in e && typeof e.code === 'string') {
     return e.code
   }
-  // 2. 没有标准 code 字段时返回 undefined。
+  // 2. 没有标准错误码字段时返回 undefined。
   return undefined
 }
 
@@ -193,15 +193,15 @@ export function getErrnoCode(e: unknown): string | undefined {
  * 判断错误是否表示路径不存在。
  *
  * @param e 捕获到的未知错误值。
- * @returns true 表示 errno code 为 `ENOENT`。
+ * @returns true 表示文件系统错误码为 `ENOENT`。
  */
 export function isENOENT(e: unknown): boolean {
-  // 1. 复用 errno 提取逻辑，集中处理未知错误形状。
+  // 1. 复用错误码提取逻辑，集中处理未知错误形状。
   return getErrnoCode(e) === 'ENOENT'
 }
 
 /**
- * 读取 Node 文件系统错误中关联的路径。
+ * 读取运行时文件系统错误中关联的路径。
  *
  * @param e 捕获到的未知错误值。
  * @returns 错误对象里的 path 字段；不存在时返回 undefined。
@@ -216,22 +216,22 @@ export function getErrnoPath(e: unknown): string | undefined {
 }
 
 /**
- * 提取错误消息和前几层 stack frame。
+ * 提取错误消息和前几层调用栈帧。
  *
  * @param e 捕获到的未知错误值。
- * @param maxFrames 最多保留的 stack frame 数量，默认 5。
+ * @param maxFrames 最多保留的调用栈帧数量，默认 5。
  * @returns 精简后的错误堆栈文本。
  */
 export function shortErrorStack(e: unknown, maxFrames = 5): string {
-  // 1. 非 Error 没有 stack，只能返回字符串化结果。
+  // 1. 非错误对象没有调用栈，只能返回字符串化结果。
   if (!(e instanceof Error)) return String(e)
-  // 2. 没有 stack 时至少返回 message。
+  // 2. 没有调用栈时至少返回错误消息。
   if (!e.stack) return e.message
-  // 3. V8/Bun stack 首行是错误摘要，后续 `at` 行才是调用帧。
+  // 3. 运行时调用栈首行是错误摘要，后续 `at` 行才是调用帧。
   const lines = e.stack.split('\n')
   const header = lines[0] ?? e.message
   const frames = lines.slice(1).filter(l => l.trim().startsWith('at '))
-  // 4. 帧数不多时保留原 stack，避免丢失有用信息。
+  // 4. 帧数不多时保留原调用栈，避免丢失有用信息。
   if (frames.length <= maxFrames) return e.stack
   // 5. 帧数过多时截断，减少塞进模型上下文的内部噪音。
   return [header, ...frames.slice(0, maxFrames)].join('\n')
@@ -244,7 +244,7 @@ export function shortErrorStack(e: unknown, maxFrames = 5): string {
  * @returns true 表示路径不存在、权限不足、路径结构错误或符号链接循环。
  */
 export function isFsInaccessible(e: unknown): e is NodeJS.ErrnoException {
-  // 1. 先提取 errno code，再按文件访问场景的可预期错误集合判断。
+  // 1. 先提取文件系统错误码，再按文件访问场景的可预期错误集合判断。
   const code = getErrnoCode(e)
   return (
     code === 'ENOENT' ||
@@ -255,7 +255,7 @@ export function isFsInaccessible(e: unknown): e is NodeJS.ErrnoException {
   )
 }
 
-/** Axios 请求错误的粗粒度分类，用于决定重试、跳过或展示策略。 */
+/** 网络请求错误的粗粒度分类，用于决定重试、跳过或展示策略。 */
 export type AxiosErrorKind =
   | 'auth'
   | 'timeout'
@@ -264,19 +264,19 @@ export type AxiosErrorKind =
   | 'other'
 
 /**
- * 将 Axios 请求异常归类。
+ * 将网络请求异常归类。
  *
  * @param e 捕获到的未知错误值。
- * @returns 错误类别、可选 HTTP 状态码和可读消息。
+ * @returns 错误类别、可选网络状态码和可读消息。
  */
 export function classifyAxiosError(e: unknown): {
   kind: AxiosErrorKind
   status?: number
   message: string
 } {
-  // 1. 先提取通用消息，非 Axios 错误也能返回可展示文本。
+  // 1. 先提取通用消息，非请求库错误也能返回可展示文本。
   const message = errorMessage(e)
-  // 2. 通过 Axios 标记字段识别请求错误，避免引入 axios 依赖。
+  // 2. 通过请求库标记字段识别请求错误，避免引入额外依赖。
   if (
     !e ||
     typeof e !== 'object' ||
@@ -285,7 +285,7 @@ export function classifyAxiosError(e: unknown): {
   ) {
     return { kind: 'other', message }
   }
-  // 3. 只读取分类所需字段，不依赖完整 Axios 类型。
+  // 3. 只读取分类所需字段，不依赖完整请求库类型。
   const err = e as {
     response?: { status?: number }
     code?: string
@@ -298,6 +298,6 @@ export function classifyAxiosError(e: unknown): {
   if (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND') {
     return { kind: 'network', status, message }
   }
-  // 6. 其他 Axios 错误保留为普通 HTTP 类别。
+  // 6. 其他请求错误保留为普通网络错误类别。
   return { kind: 'http', status, message }
 }

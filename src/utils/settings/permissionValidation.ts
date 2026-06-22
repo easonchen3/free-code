@@ -117,10 +117,10 @@ export function validatePermissionRule(rule: string): {
   // 4. 将字符串拆成工具名和可选规则内容；解析器会处理旧工具名和转义括号。
   const parsed = permissionRuleValueFromString(rule)
 
-  // 5. MCP 工具名不是普通内置工具名，必须先按 MCP 的 server/tool 结构校验。
+  // 5. MCP 工具名不是普通内置工具名，必须先按 MCP 的服务名/工具名结构校验。
   const mcpInfo = mcpInfoFromString(parsed.toolName)
   if (mcpInfo) {
-    // 6. MCP 权限只支持 server、通配工具或具体工具三种粒度，不支持括号模式。
+    // 6. MCP 权限只支持服务、通配工具或具体工具三种粒度，不支持括号模式。
     if (parsed.ruleContent !== undefined || countUnescapedChar(rule, '(') > 0) {
       return {
         valid: false,
@@ -154,7 +154,7 @@ export function validatePermissionRule(rule: string): {
     }
   }
 
-  // 10. 优先执行工具自己的语义校验，例如 WebFetch 的 domain 前缀规则。
+  // 10. 优先执行工具自己的语义校验，例如网页抓取工具的域名前缀规则。
   const customValidation = getCustomValidation(parsed.toolName)
   if (customValidation && parsed.ruleContent !== undefined) {
     const customResult = customValidation(parsed.ruleContent)
@@ -163,7 +163,7 @@ export function validatePermissionRule(rule: string): {
     }
   }
 
-  // 11. Bash 规则同时支持新通配语法和旧 `:*` 前缀语法，需要拦截常见误写。
+  // 11. 命令行规则同时支持新通配语法和旧 `:*` 前缀语法，需要拦截常见误写。
   if (isBashPrefixTool(parsed.toolName) && parsed.ruleContent !== undefined) {
     const content = parsed.ruleContent
 
@@ -191,14 +191,14 @@ export function validatePermissionRule(rule: string): {
       }
     }
 
-    // 14. 不校验 Bash 引号配对；shell 合法写法很多，过度校验会误伤有效命令。
+    // 14. 不校验命令行引号配对；合法写法很多，过度校验会误伤有效命令。
   }
 
-  // 15. 文件类工具使用 glob 思维，和 Bash 的命令前缀匹配需要分开提示。
+  // 15. 文件类工具使用通配路径思维，和命令行的命令前缀匹配需要分开提示。
   if (isFilePatternTool(parsed.toolName) && parsed.ruleContent !== undefined) {
     const content = parsed.ruleContent
 
-    // 16. 文件路径不支持 Bash 的 `:*` 前缀语法，应提示改用 glob。
+    // 16. 文件路径不支持命令行的 `:*` 前缀语法，应提示改用通配路径。
     if (content.includes(':*')) {
       return {
         valid: false,
@@ -212,7 +212,7 @@ export function validatePermissionRule(rule: string): {
       }
     }
 
-    // 17. 路径通配符放在单词中间通常是误用，给出更符合 glob 直觉的例子。
+    // 17. 路径通配符放在单词中间通常是误用，给出更符合通配路径直觉的例子。
     if (
       content.includes('*') &&
       !content.match(/^\*|\*$|\*\*|\/\*|\*\.|\*\)/) &&
@@ -236,13 +236,13 @@ export function validatePermissionRule(rule: string): {
 }
 
 /**
- * 权限规则字符串的 Zod 校验器。
+ * 权限规则字符串的结构化校验器。
  *
- * @returns 可复用的 schema；校验失败时会把建议和示例合并进 Zod issue。
+ * @returns 可复用的校验结构；校验失败时会把建议和示例合并进校验问题。
  */
 export const PermissionRuleSchema = lazySchema(() =>
   z.string().superRefine((val, ctx) => {
-    // 1. 复用业务校验，保证 settings 解析和手动调用得到一致结果。
+    // 1. 复用业务校验，保证配置解析和手动调用得到一致结果。
     const result = validatePermissionRule(val)
     if (!result.valid) {
       // 2. 将错误、建议和示例拼成一条面向用户的配置错误信息。
@@ -259,6 +259,6 @@ export const PermissionRuleSchema = lazySchema(() =>
         params: { received: val },
       })
     }
-    // 3. 校验通过时不添加 issue，交给 Zod 返回原始字符串。
+    // 3. 校验通过时不添加问题，交给结构化校验器返回原始字符串。
   }),
 )

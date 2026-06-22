@@ -1,12 +1,12 @@
-/** 顺序执行队列中的单次调用记录，保存参数、Promise 回调和调用时的 this。 */
+/** 顺序执行队列中的单次调用记录，保存参数、异步结果回调和调用时的上下文对象。 */
 type QueueItem<T extends unknown[], R> = {
   /** 调用原函数时传入的参数。 */
   args: T
-  /** 原函数成功后用于兑现外层 Promise。 */
+  /** 原函数成功后用于兑现外层异步结果。 */
   resolve: (value: R) => void
-  /** 原函数失败后用于拒绝外层 Promise。 */
+  /** 原函数失败后用于拒绝外层异步结果。 */
   reject: (reason?: unknown) => void
-  /** 调用包装函数时的 this，用于保持方法调用语义。 */
+  /** 调用包装函数时的上下文对象，用于保持方法调用语义。 */
   context: unknown
 }
 
@@ -29,7 +29,7 @@ export function sequential<T extends unknown[], R>(
   /**
    * 消费队列中的待执行任务。
    *
-   * @returns 队列本轮消费完成后 resolved 的 Promise。
+   * @returns 队列本轮消费完成后完成的异步结果。
    */
   async function processQueue(): Promise<void> {
     // 1. 已有消费者运行时直接返回，避免多个循环并发取队列。
@@ -40,7 +40,7 @@ export function sequential<T extends unknown[], R>(
     // 3. 标记执行中，后续新调用只入队不另起消费者。
     processing = true
 
-    // 4. 按 FIFO 顺序逐个执行原函数，并把结果转发给对应 Promise。
+    // 4. 按先进先出顺序逐个执行原函数，并把结果转发给对应异步结果。
     while (queue.length > 0) {
       const { args, resolve, reject, context } = queue.shift()!
 
@@ -62,9 +62,9 @@ export function sequential<T extends unknown[], R>(
   }
 
   return function (this: unknown, ...args: T): Promise<R> {
-    // 1. 每次调用都创建独立 Promise，并把兑现/拒绝回调放入队列。
+    // 1. 每次调用都创建独立异步结果，并把兑现或拒绝回调放入队列。
     return new Promise((resolve, reject) => {
-      // 2. 保存 this 和参数，保证包装后仍能作为对象方法使用。
+      // 2. 保存调用上下文和参数，保证包装后仍能作为对象方法使用。
       queue.push({ args, resolve, reject, context: this })
       // 3. 尝试启动队列消费；如果已有消费者，processQueue 会自行跳过。
       void processQueue()
