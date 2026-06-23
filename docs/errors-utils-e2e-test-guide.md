@@ -76,3 +76,45 @@ bun run "$env:FREE_CODE_E2E_ROOT\verify.ts" | Tee-Object "$env:FREE_CODE_E2E_ROO
 ```
 
 验收标准：所有 `passed` 为 `true`。
+
+## 4. 人工复核与不可自动化边界
+
+本文件验证错误对象的分类和格式化。自动脚本能构造常见错误形状；人工复核用于确认真实系统错误和网络错误在当前平台上仍能被归类。
+
+人工操作：
+
+1. 执行第 3 节脚本，生成 `result.json`。
+2. 打开 `D:\tmp\free-code-errors-utils-e2e\result.json`，确认所有 `passed` 为 `true`。
+3. 人工触发一个真实文件不存在错误：
+
+   ```powershell
+   $Script = @'
+   import { readFileSync } from "node:fs";
+   import { getErrnoCode, getErrnoPath, isENOENT, isFsInaccessible } from "D:/Code/free-code/src/utils/errors.ts";
+   try {
+     readFileSync("D:/tmp/free-code-errors-utils-e2e/not-found.txt");
+   } catch (e) {
+     console.log(JSON.stringify({
+       code: getErrnoCode(e),
+       path: getErrnoPath(e),
+       enoent: isENOENT(e),
+       inaccessible: isFsInaccessible(e),
+     }, null, 2));
+   }
+   '@
+   Set-Content "$env:FREE_CODE_E2E_ROOT\real-fs-error.ts" $Script -Encoding UTF8
+   bun run "$env:FREE_CODE_E2E_ROOT\real-fs-error.ts"
+   ```
+
+4. 如果要复核真实网络错误，使用一个不可访问域名或本地关闭端口构造请求库错误，并记录 `classifyAxiosError()` 结果。
+
+通过标准：
+
+- 合成错误和真实文件系统错误都能被稳定归类。
+- 不存在路径返回 `ENOENT`，且 `isFsInaccessible()` 为 true。
+- `shortErrorStack()` 不泄漏过多堆栈帧。
+
+不可自动化边界：
+
+- 真实网络错误依赖网络环境和代理设置，不应作为默认必跑项；人工执行时必须记录目标地址、代理环境和错误对象摘要。
+- 遥测安全错误的“消息是否不含路径/代码”需要人工审查调用方传入内容，脚本只能验证字段保存行为。

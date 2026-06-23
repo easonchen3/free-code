@@ -64,3 +64,27 @@ bun run "$env:FREE_CODE_E2E_ROOT\verify.ts" | Tee-Object "$env:FREE_CODE_E2E_ROO
 - 每项 `passed` 为 `true`。
 - malformed 输入不会抛异常。
 - 转义内容能完成 parse/stringify 往返。
+
+## 5. 人工复核与不可自动化边界
+
+本文件验证的是权限规则字符串的解析和序列化，脚本可以覆盖主要黑盒输入；人工复核用于确认“保守回退”不会被误读成授权成功。
+
+人工操作：
+
+1. 执行第 4 节生成 `result.json`。
+2. 打开 `D:\tmp\free-code-permission-rule-parser-e2e\result.json`。
+3. 对以下记录做人工确认：
+   - `malformed-fallback`：非法结构应整体当作工具名，不应产生 `ruleContent`。
+   - `empty-content` 和 `wildcard-content`：空内容和单独 `*` 应等价于工具级规则。
+   - `serialize-parens`：括号必须被转义，避免写回后改变规则边界。
+   - `legacy-task` 和 `legacy-list`：历史工具名应归一化，同时旧名仍能被查询到。
+
+通过标准：
+
+- 所有 `passed` 为 `true`。
+- `Tool(content)` 往返后不会丢失反斜杠或括号语义。
+- 非法输入不会抛异常，也不会被解析成更宽的权限。
+
+不可自动化边界：
+
+- 是否需要兼容新增历史工具名依赖产品演进，无法由当前脚本自动发现；新增工具重命名时必须人工补充别名用例。

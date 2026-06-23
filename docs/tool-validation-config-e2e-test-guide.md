@@ -57,3 +57,28 @@ bun run "$env:FREE_CODE_E2E_ROOT\verify.ts" | Tee-Object "$env:FREE_CODE_E2E_ROO
 ```
 
 所有 `passed` 必须为 `true`。
+
+## 4. 人工复核与不可自动化边界
+
+本文件是权限规则校验层的配置表，自动脚本能验证当前分类和专属校验函数；人工复核用于确认配置表是否和产品真实工具列表保持一致。
+
+人工操作：
+
+1. 执行第 3 节生成 `result.json`。
+2. 打开 `D:\tmp\free-code-tool-validation-config-e2e\result.json`，确认所有 `passed` 为 `true`。
+3. 对照当前产品工具列表，人工检查：
+   - 文件路径类工具是否都在 `filePatternTools`。
+   - 命令行类工具是否只出现在 `bashPrefixTools`。
+   - `WebSearch` 是否仍不支持 `*`、`?`。
+   - `WebFetch` 是否仍强制使用 `domain:`。
+4. 如发现新增工具没有分类，记录工具名、规则语义和应加入的分类。
+
+通过标准：
+
+- 当前脚本全绿。
+- 配置分类和产品公开工具语义一致。
+- 新增工具的权限规则语义有明确归属，不靠默认行为猜测。
+
+不可自动化边界：
+
+- “工具列表是否完整”依赖产品注册表和发布策略，不能只靠该配置文件自动判断；需要人工和实际工具清单交叉核对。

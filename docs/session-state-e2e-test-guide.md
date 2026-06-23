@@ -70,3 +70,29 @@ bun run "$env:FREE_CODE_E2E_ROOT\verify.ts" | Tee-Object "$env:FREE_CODE_E2E_ROO
 ```
 
 验收标准：`checks` 中所有 `passed` 为 `true`。
+
+## 3. 人工复核与不可自动化边界
+
+本文件的自动脚本验证会话状态监听、外部元数据增量和权限模式通知。人工复核用于确认事件顺序和增量内容是否符合真实客户端消费预期。
+
+人工操作：
+
+1. 执行第 2 节脚本，生成 `result.json`。
+2. 打开 `D:\tmp\free-code-session-state-e2e\result.json`。
+3. 人工确认：
+   - `states` 的顺序是 `running`、`requires_action`、`idle`。
+   - 进入 `requires_action` 时出现 `pending_action`。
+   - 离开阻塞态时出现 `pending_action: null`。
+   - 回到 `idle` 时出现 `task_summary: null`。
+   - 权限模式监听器收到 `default`。
+4. 如果要验证真实客户端桥接层，启动使用会话状态的产品入口，触发一次需要权限的工具调用，记录外部元数据流中的 `pending_action` 设置和清除。
+
+通过标准：
+
+- 自动脚本全绿。
+- 状态顺序和元数据增量符合真实 UI/SDK 订阅方预期。
+- 清除事件使用 `null`，不是省略字段。
+
+不可自动化边界：
+
+- 外部客户端如何展示 `external_metadata` 取决于调用入口，默认脚本只能验证本模块发出的增量；真实 UI 或 SDK 消费需要人工在对应产品入口确认。

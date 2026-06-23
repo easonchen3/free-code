@@ -88,3 +88,30 @@ bun run "$env:FREE_CODE_E2E_ROOT\verify.ts" | Tee-Object "$env:FREE_CODE_E2E_ROO
 Remove-Item -Recurse -Force $env:FREE_CODE_E2E_ROOT -ErrorAction SilentlyContinue
 Remove-Item Env:\FREE_CODE_E2E_ROOT -ErrorAction SilentlyContinue
 ```
+
+## 7. 人工复核与不可自动化边界
+
+本文件的逻辑是纯权限规则校验，默认可以通过上面的临时脚本自动验证；人工复核用于确认错误提示是否对真实配置用户足够清晰。
+
+人工操作：
+
+1. 执行第 2 到第 4 节，生成 `result.json`。
+2. 打开 `D:\tmp\free-code-permission-validation-e2e\result.json`。
+3. 逐条检查失败用例的 `message`、`error` 或 `suggestion` 字段是否包含明确修复方向。
+4. 重点确认这些分支：
+   - 空规则提示不能配置空字符串。
+   - 括号不配对提示补齐括号。
+   - `Bash()` 提示改成 `Bash` 或补充具体模式。
+   - `WebFetch(https://...)` 提示使用 `domain:`。
+   - `Read(src:*)` 提示文件规则不要使用 Bash 前缀语法。
+
+通过标准：
+
+- 所有 `passed` 都为 `true`。
+- 每个失败规则都有面向用户的错误原因或修复建议。
+- 人工复核不需要调用内部私有函数，也不需要真实 CLI 交互。
+
+不可自动化边界：
+
+- 文案是否“足够易懂”需要人工判断；脚本只能验证字段存在和分支结果。
+- 如果未来新增工具专属规则，需要在本文档中补对应输入、预期错误和人工文案检查点。

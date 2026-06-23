@@ -73,3 +73,33 @@ bun run "$env:FREE_CODE_E2E_ROOT\verify.ts" | Tee-Object "$env:FREE_CODE_E2E_ROO
 ```
 
 验收标准：所有 `passed` 为 `true`，且 function hook 不出现在普通 Hook 视图中。
+
+## 3. 人工复核与不可自动化边界
+
+本文件没有直接 settings/CLI 黑盒入口，上面的脚本是面向公开导出的会话态 Hook API 的端到端行为验证。人工复核需要明确区分“API 级验证通过”和“产品入口真实触发通过”。
+
+人工操作：
+
+1. 执行第 2 节脚本，生成 `result.json`。
+2. 打开 `D:\tmp\free-code-session-hooks-e2e\result.json`。
+3. 人工确认：
+   - 普通 Hook 注册后能在 `getSessionHooks()` 中读到。
+   - function hook 注册后只出现在 `getSessionFunctionHooks()`。
+   - `getSessionHookCallback()` 返回成功回调，且回调被执行。
+   - 删除普通 Hook 和 function hook 后对应事件视图为空。
+   - `clearSessionHooks()` 删除整个 session。
+4. 产品入口人工补充：
+   - 找到当前产品中调用 `addSessionHook()` 或 `addFunctionHook()` 的入口，例如 teammate、swarm、SDK 或 bridge 初始化流程。
+   - 通过该入口注册一个 function hook，触发 `Stop` 或对应事件。
+   - 记录 hook 输入、返回值和阻断/放行结果。
+
+通过标准：
+
+- API 级脚本所有 `passed` 为 `true`。
+- function hook 不泄漏到普通 Hook 视图。
+- 如果产品入口存在，真实事件触发时 function hook 能收到消息历史或事件输入。
+
+不可自动化边界：
+
+- 会话态 Hook 依赖内存中的 `AppState` 和产品注册入口，普通 settings 文件无法表达。
+- 如果当前构建没有暴露注册入口，记录 `rg "addFunctionHook|addSessionHook"` 的搜索结果和不可达原因，不能把内部脚本验证写成完整 CLI 黑盒通过。
