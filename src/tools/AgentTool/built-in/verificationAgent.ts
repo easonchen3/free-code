@@ -7,6 +7,14 @@ import { WEB_FETCH_TOOL_NAME } from 'src/tools/WebFetchTool/prompt.js'
 import { AGENT_TOOL_NAME } from '../constants.js'
 import type { BuiltInAgentDefinition } from '../loadAgentsDir.js'
 
+/**
+ * 内置验证 Agent 定义模块。
+ *
+ * 该文件只声明验证 Agent 的系统提示词、使用场景和工具边界，
+ * 让主 Agent 在完成非平凡实现后，可以调用一个只验证不修改项目的专用 Agent。
+ */
+
+/** 验证 Agent 的系统提示词，定义验证目标、禁止写项目文件的边界和报告格式。 */
 const VERIFICATION_SYSTEM_PROMPT = `You are a verification specialist. Your job is not to confirm the implementation works — it's to try to break it.
 
 You have two documented failure patterns. First, verification avoidance: when faced with a check, you find reasons not to run it — you read code, narrate what you would test, write "PASS," and move on. Second, being seduced by the first 80%: you see a polished UI or a passing test suite and feel inclined to pass it, not noticing half the buttons do nothing, the state vanishes on refresh, or the backend crashes on bad input. The first 80% is the easy part. Your entire value is in finding the last 20%. The caller may spot-check your commands by re-running them — if a PASS step has no command output, or output that doesn't match re-execution, your report gets rejected.
@@ -128,9 +136,11 @@ Use the literal string \`VERDICT: \` followed by exactly one of \`PASS\`, \`FAIL
 - **FAIL**: include what failed, exact error output, reproduction steps.
 - **PARTIAL**: what was verified, what could not be and why (missing tool/env), what the implementer should know.`
 
+/** 验证 Agent 的触发建议，用于告诉调度层何时应该把验证工作交给该内置 Agent。 */
 const VERIFICATION_WHEN_TO_USE =
   'Use this agent to verify that implementation work is correct before reporting completion. Invoke after non-trivial tasks (3+ file edits, backend/API changes, infrastructure changes). Pass the ORIGINAL user task description, list of files changed, and approach taken. The agent runs builds, tests, linters, and checks to produce a PASS/FAIL/PARTIAL verdict with evidence.'
 
+/** 内置验证 Agent 配置，固定为后台运行，并禁止其直接修改项目文件或发起子 Agent。 */
 export const VERIFICATION_AGENT: BuiltInAgentDefinition = {
   agentType: 'verification',
   whenToUse: VERIFICATION_WHEN_TO_USE,
@@ -146,7 +156,15 @@ export const VERIFICATION_AGENT: BuiltInAgentDefinition = {
   source: 'built-in',
   baseDir: 'built-in',
   model: 'inherit',
-  getSystemPrompt: () => VERIFICATION_SYSTEM_PROMPT,
+  /**
+   * 返回验证 Agent 的系统提示词。
+   *
+   * @returns 用于约束验证 Agent 行为和输出格式的完整系统提示词。
+   */
+  getSystemPrompt: () => {
+    // 1. 内置验证 Agent 的提示词是固定文本，调用时直接返回同一份约束。
+    return VERIFICATION_SYSTEM_PROMPT
+  },
   criticalSystemReminder_EXPERIMENTAL:
     'CRITICAL: This is a VERIFICATION-ONLY task. You CANNOT edit, write, or create files IN THE PROJECT DIRECTORY (tmp is allowed for ephemeral test scripts). You MUST end with VERDICT: PASS, VERDICT: FAIL, or VERDICT: PARTIAL.',
 }
