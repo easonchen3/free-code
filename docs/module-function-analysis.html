@@ -1,0 +1,913 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>free-code 模块功能分析说明图</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --ink: #17202a;
+      --muted: #667085;
+      --line: #d7dde6;
+      --blue: #2563eb;
+      --green: #0f766e;
+      --amber: #b45309;
+      --red: #b42318;
+      --violet: #6d28d9;
+      --cyan: #047857;
+      --soft-blue: #eaf1ff;
+      --soft-green: #e9f7f4;
+      --soft-amber: #fff4df;
+      --soft-red: #ffeceb;
+      --soft-violet: #f1ebff;
+      --soft-gray: #eef1f5;
+      font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", Arial, sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      line-height: 1.65;
+    }
+
+    header {
+      background: #111827;
+      color: #fff;
+      padding: 34px 40px 30px;
+      border-bottom: 5px solid #38bdf8;
+    }
+
+    header h1 {
+      margin: 0 0 10px;
+      font-size: 30px;
+      letter-spacing: 0;
+    }
+
+    header p {
+      max-width: 1100px;
+      margin: 6px 0 0;
+      color: #d1d5db;
+      font-size: 15px;
+    }
+
+    main {
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 28px 22px 52px;
+    }
+
+    section {
+      margin: 0 0 24px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 22px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.04);
+    }
+
+    h2 {
+      margin: 0 0 14px;
+      font-size: 22px;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      margin: 18px 0 8px;
+      font-size: 17px;
+    }
+
+    p {
+      margin: 8px 0;
+    }
+
+    code {
+      padding: 2px 5px;
+      border-radius: 4px;
+      background: #eef2f7;
+      color: #1f2937;
+      font-family: Consolas, "SFMono-Regular", Menlo, monospace;
+      font-size: 0.92em;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid rgba(255, 255, 255, 0.24);
+      border-radius: 999px;
+      padding: 5px 12px;
+      color: #e5e7eb;
+      font-size: 13px;
+      background: rgba(255, 255, 255, 0.08);
+    }
+
+    .legend {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin: 14px 0 0;
+    }
+
+    .legend-item {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px 12px;
+      font-size: 14px;
+      background: #fbfcfe;
+    }
+
+    .legend-item strong {
+      display: block;
+      margin-bottom: 3px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 14px;
+    }
+
+    .cluster {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      min-height: 160px;
+    }
+
+    .cluster h3 {
+      margin-top: 0;
+    }
+
+    .cluster ul {
+      padding-left: 18px;
+      margin: 8px 0 0;
+    }
+
+    .cluster li {
+      margin: 4px 0;
+    }
+
+    .tool { background: var(--soft-blue); border-color: #b9ccff; }
+    .file { background: var(--soft-green); border-color: #b8e2dc; }
+    .session { background: var(--soft-amber); border-color: #f6d18a; }
+    .config { background: var(--soft-violet); border-color: #d5c4ff; }
+    .guard { background: var(--soft-red); border-color: #f5b8b5; }
+    .base { background: var(--soft-gray); border-color: #ccd4df; }
+
+    .diagram-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcff;
+      padding: 8px;
+    }
+
+    svg {
+      display: block;
+      min-width: 980px;
+      width: 100%;
+      height: auto;
+    }
+
+    .svg-title {
+      font-weight: 700;
+      font-size: 17px;
+      fill: #111827;
+    }
+
+    .svg-note {
+      font-size: 12px;
+      fill: #4b5563;
+    }
+
+    .box-title {
+      font-weight: 700;
+      font-size: 14px;
+      fill: #111827;
+    }
+
+    .box-text {
+      font-size: 12px;
+      fill: #344054;
+    }
+
+    .swimlane {
+      fill: #ffffff;
+      stroke: #d7dde6;
+      stroke-width: 1;
+    }
+
+    .arrow {
+      stroke: #667085;
+      stroke-width: 2;
+      fill: none;
+      marker-end: url(#arrow);
+    }
+
+    .arrow-strong {
+      stroke: #2563eb;
+      stroke-width: 2.4;
+      fill: none;
+      marker-end: url(#arrow-blue);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+      font-size: 14px;
+    }
+
+    th,
+    td {
+      border: 1px solid var(--line);
+      padding: 10px 11px;
+      vertical-align: top;
+      text-align: left;
+    }
+
+    th {
+      background: #eef2f7;
+      color: #111827;
+      white-space: nowrap;
+    }
+
+    tbody tr:nth-child(even) {
+      background: #fafbfc;
+    }
+
+    .path {
+      white-space: nowrap;
+    }
+
+    .module-name {
+      font-weight: 700;
+      color: #111827;
+      white-space: nowrap;
+    }
+
+    .note-list {
+      margin: 8px 0 0;
+      padding-left: 18px;
+    }
+
+    .note-list li {
+      margin: 5px 0;
+    }
+
+    @media print {
+      body {
+        background: #fff;
+      }
+
+      header {
+        background: #fff;
+        color: #111827;
+        border-bottom-color: #111827;
+      }
+
+      header p,
+      .pill {
+        color: #374151;
+        border-color: #d1d5db;
+        background: #fff;
+      }
+
+      section {
+        box-shadow: none;
+        page-break-inside: avoid;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>free-code 模块功能分析说明图</h1>
+    <p>
+      本文档按“工具入口、文件基础设施、会话恢复、配置与 Hook、权限校验、通用工具”六个层次梳理指定模块，
+      重点说明模块职责、协作边界、关键输入输出以及变更时需要关注的影响面。
+    </p>
+    <div class="meta">
+      <span class="pill">仓库：D:\Code\free-code</span>
+      <span class="pill">生成日期：2026-06-24</span>
+      <span class="pill">形式：自包含 HTML，无外部依赖</span>
+    </div>
+  </header>
+
+  <main>
+    <section>
+      <h2>一、模块分层总览</h2>
+      <p>
+        这些文件可以理解为一条从“用户请求”到“工具执行”，再到“状态持久化与恢复”的主链路。
+        工具模块负责把能力暴露给 Agent；文件、路径、权限模块负责约束实际 IO；会话模块负责让上下文可恢复；
+        Hook 与配置模块则负责把项目级策略注入运行过程。
+      </p>
+      <div class="grid">
+        <div class="cluster tool">
+          <h3>工具入口层</h3>
+          <p>将 Agent 的意图转换成具体操作，统一走权限、路径和结果包装。</p>
+          <ul>
+            <li><code>SkillTool</code></li>
+            <li><code>FileReadTool</code> / <code>FileWriteTool</code> / <code>FileEditTool</code></li>
+            <li><code>GrepTool</code> / <code>GlobTool</code></li>
+          </ul>
+        </div>
+        <div class="cluster file">
+          <h3>文件与平台基础层</h3>
+          <p>提供跨平台路径、文件读写、文件系统抽象、Shell Provider 与环境变量处理。</p>
+          <ul>
+            <li><code>path</code> / <code>file</code> / <code>fileRead</code></li>
+            <li><code>fsOperations</code> / <code>filesystem</code></li>
+            <li><code>bashProvider</code> / <code>env</code> / <code>platform</code></li>
+          </ul>
+        </div>
+        <div class="cluster session">
+          <h3>会话生命周期层</h3>
+          <p>负责会话文件定位、Transcript 读取、恢复、消息反序列化和工具结果外置存储。</p>
+          <ul>
+            <li><code>sessionStorage</code> / <code>sessionStoragePortable</code></li>
+            <li><code>sessionStart</code> / <code>sessionRestore</code></li>
+            <li><code>conversationRecovery</code> / <code>toolResultStorage</code> / <code>sessionState</code></li>
+          </ul>
+        </div>
+        <div class="cluster config">
+          <h3>配置与 Hook 层</h3>
+          <p>把项目配置、Markdown 配置、Agent 配置和 Hook 注册统一接入会话执行过程。</p>
+          <ul>
+            <li><code>config</code> / <code>markdownConfigLoader</code> / <code>frontmatterParser</code></li>
+            <li><code>loadAgentsDir</code></li>
+            <li><code>hooks</code> / <code>hooksConfigSnapshot</code> / <code>sessionHooks</code></li>
+          </ul>
+        </div>
+        <div class="cluster guard">
+          <h3>权限与校验层</h3>
+          <p>解析权限规则，校验工具参数，让读写、Bash 前缀和文件模式具备一致的安全边界。</p>
+          <ul>
+            <li><code>settings/permissionValidation</code></li>
+            <li><code>permissions/permissionRuleParser</code></li>
+            <li><code>settings/toolValidationConfig</code></li>
+          </ul>
+        </div>
+        <div class="cluster base">
+          <h3>通用支撑层</h3>
+          <p>提供 JSON/JSONC 解析、错误识别、顺序执行控制等轻量基础能力。</p>
+          <ul>
+            <li><code>json</code> / <code>errors</code></li>
+            <li><code>sequential</code></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>二、整体架构关系图</h2>
+      <div class="diagram-wrap">
+        <svg viewBox="0 0 1180 560" role="img" aria-label="free-code 指定模块整体架构关系图">
+          <defs>
+            <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L0,6 L9,3 z" fill="#667085"></path>
+            </marker>
+            <marker id="arrow-blue" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L0,6 L9,3 z" fill="#2563eb"></path>
+            </marker>
+          </defs>
+
+          <text x="24" y="34" class="svg-title">运行时主链路：请求进入工具层，经过权限与文件基础设施，再写入会话状态和恢复体系</text>
+
+          <rect x="30" y="72" width="180" height="90" rx="8" fill="#eaf1ff" stroke="#9bb8ff"></rect>
+          <text x="54" y="104" class="box-title">用户 / Agent 请求</text>
+          <text x="54" y="130" class="box-text">自然语言、工具参数</text>
+          <text x="54" y="150" class="box-text">会话恢复入口</text>
+
+          <rect x="278" y="44" width="230" height="146" rx="8" fill="#eaf1ff" stroke="#9bb8ff"></rect>
+          <text x="302" y="78" class="box-title">工具入口层</text>
+          <text x="302" y="104" class="box-text">SkillTool</text>
+          <text x="302" y="124" class="box-text">FileRead / FileWrite / FileEdit</text>
+          <text x="302" y="144" class="box-text">GrepTool / GlobTool</text>
+          <text x="302" y="166" class="box-text">将意图转为受控执行</text>
+
+          <rect x="590" y="44" width="230" height="146" rx="8" fill="#ffeceb" stroke="#f1aaa6"></rect>
+          <text x="614" y="78" class="box-title">权限与校验层</text>
+          <text x="614" y="104" class="box-text">permissionValidation</text>
+          <text x="614" y="124" class="box-text">permissionRuleParser</text>
+          <text x="614" y="144" class="box-text">toolValidationConfig</text>
+          <text x="614" y="166" class="box-text">统一判断允许、拒绝或询问</text>
+
+          <rect x="910" y="44" width="220" height="146" rx="8" fill="#e9f7f4" stroke="#a6dcd4"></rect>
+          <text x="934" y="78" class="box-title">文件与平台基础层</text>
+          <text x="934" y="104" class="box-text">path / file / fileRead</text>
+          <text x="934" y="124" class="box-text">fsOperations / filesystem</text>
+          <text x="934" y="144" class="box-text">bashProvider / env / platform</text>
+          <text x="934" y="166" class="box-text">屏蔽 OS 与 IO 差异</text>
+
+          <rect x="278" y="292" width="250" height="150" rx="8" fill="#fff4df" stroke="#f2ca7c"></rect>
+          <text x="302" y="326" class="box-title">会话生命周期层</text>
+          <text x="302" y="352" class="box-text">sessionStart / sessionStorage</text>
+          <text x="302" y="372" class="box-text">sessionStoragePortable</text>
+          <text x="302" y="392" class="box-text">sessionRestore / conversationRecovery</text>
+          <text x="302" y="414" class="box-text">toolResultStorage / sessionState</text>
+
+          <rect x="610" y="292" width="250" height="150" rx="8" fill="#f1ebff" stroke="#cfbcff"></rect>
+          <text x="634" y="326" class="box-title">配置与 Hook 层</text>
+          <text x="634" y="352" class="box-text">config / markdownConfigLoader</text>
+          <text x="634" y="372" class="box-text">frontmatterParser / loadAgentsDir</text>
+          <text x="634" y="392" class="box-text">hooks / hooksConfigSnapshot</text>
+          <text x="634" y="414" class="box-text">sessionHooks</text>
+
+          <rect x="932" y="292" width="198" height="150" rx="8" fill="#eef1f5" stroke="#ccd4df"></rect>
+          <text x="956" y="326" class="box-title">通用支撑层</text>
+          <text x="956" y="352" class="box-text">json / errors</text>
+          <text x="956" y="372" class="box-text">sequential</text>
+          <text x="956" y="394" class="box-text">提供解析、错误识别</text>
+          <text x="956" y="414" class="box-text">和任务串行化能力</text>
+
+          <path d="M210 117 L276 117" class="arrow-strong"></path>
+          <path d="M508 117 L588 117" class="arrow-strong"></path>
+          <path d="M820 117 L908 117" class="arrow-strong"></path>
+          <path d="M396 190 C398 234 398 250 402 290" class="arrow"></path>
+          <path d="M705 190 C706 232 720 250 730 290" class="arrow"></path>
+          <path d="M1012 190 C1018 230 1024 250 1028 290" class="arrow"></path>
+          <path d="M528 365 L608 365" class="arrow"></path>
+          <path d="M860 365 L930 365" class="arrow"></path>
+          <path d="M610 420 C520 494 376 494 404 444" class="arrow"></path>
+
+          <text x="238" y="104" class="svg-note">选择工具</text>
+          <text x="530" y="104" class="svg-note">校验参数与权限</text>
+          <text x="842" y="104" class="svg-note">执行 IO / Shell</text>
+          <text x="420" y="248" class="svg-note">记录可恢复状态</text>
+          <text x="742" y="248" class="svg-note">注入项目策略</text>
+          <text x="866" y="354" class="svg-note">解析与错误辅助</text>
+        </svg>
+      </div>
+    </section>
+
+    <section>
+      <h2>三、核心链路说明图</h2>
+
+      <h3>1. 文件工具执行链路</h3>
+      <div class="diagram-wrap">
+        <svg viewBox="0 0 1160 330" role="img" aria-label="文件工具执行链路图">
+          <defs>
+            <marker id="arrow2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L0,6 L9,3 z" fill="#667085"></path>
+            </marker>
+          </defs>
+          <rect x="20" y="22" width="1120" height="286" rx="8" fill="#ffffff" stroke="#d7dde6"></rect>
+          <text x="44" y="58" class="svg-title">文件工具把读、写、编辑、搜索统一纳入路径解析、权限检查和文件系统抽象</text>
+
+          <rect x="56" y="96" width="180" height="110" rx="8" fill="#eaf1ff" stroke="#9bb8ff"></rect>
+          <text x="78" y="128" class="box-title">工具入口</text>
+          <text x="78" y="154" class="box-text">FileReadTool</text>
+          <text x="78" y="174" class="box-text">FileWriteTool / FileEditTool</text>
+          <text x="78" y="194" class="box-text">GrepTool / GlobTool</text>
+
+          <rect x="300" y="96" width="180" height="110" rx="8" fill="#e9f7f4" stroke="#a6dcd4"></rect>
+          <text x="322" y="128" class="box-title">路径与文件解析</text>
+          <text x="322" y="154" class="box-text">path</text>
+          <text x="322" y="174" class="box-text">file / fileRead</text>
+          <text x="322" y="194" class="box-text">fsOperations</text>
+
+          <rect x="544" y="96" width="190" height="110" rx="8" fill="#ffeceb" stroke="#f1aaa6"></rect>
+          <text x="566" y="128" class="box-title">权限边界</text>
+          <text x="566" y="154" class="box-text">filesystem</text>
+          <text x="566" y="174" class="box-text">permissionValidation</text>
+          <text x="566" y="194" class="box-text">toolValidationConfig</text>
+
+          <rect x="800" y="96" width="150" height="110" rx="8" fill="#eef1f5" stroke="#ccd4df"></rect>
+          <text x="822" y="128" class="box-title">辅助能力</text>
+          <text x="822" y="154" class="box-text">json</text>
+          <text x="822" y="174" class="box-text">errors</text>
+          <text x="822" y="194" class="box-text">sequential</text>
+
+          <rect x="1000" y="96" width="110" height="110" rx="8" fill="#fff4df" stroke="#f2ca7c"></rect>
+          <text x="1020" y="128" class="box-title">结果</text>
+          <text x="1020" y="154" class="box-text">文本内容</text>
+          <text x="1020" y="174" class="box-text">变更摘要</text>
+          <text x="1020" y="194" class="box-text">错误反馈</text>
+
+          <path d="M236 151 L298 151" stroke="#667085" stroke-width="2" fill="none" marker-end="url(#arrow2)"></path>
+          <path d="M480 151 L542 151" stroke="#667085" stroke-width="2" fill="none" marker-end="url(#arrow2)"></path>
+          <path d="M734 151 L798 151" stroke="#667085" stroke-width="2" fill="none" marker-end="url(#arrow2)"></path>
+          <path d="M950 151 L998 151" stroke="#667085" stroke-width="2" fill="none" marker-end="url(#arrow2)"></path>
+          <path d="M1056 206 C1048 252 170 260 146 208" stroke="#667085" stroke-width="2" fill="none" marker-end="url(#arrow2)"></path>
+          <text x="420" y="250" class="svg-note">执行结果回到对话流，并可能进入会话日志或工具结果存储</text>
+        </svg>
+      </div>
+
+      <h3>2. 会话恢复与状态链路</h3>
+      <div class="diagram-wrap">
+        <svg viewBox="0 0 1160 330" role="img" aria-label="会话恢复与状态链路图">
+          <defs>
+            <marker id="arrow3" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L0,6 L9,3 z" fill="#667085"></path>
+            </marker>
+          </defs>
+          <rect x="20" y="22" width="1120" height="286" rx="8" fill="#ffffff" stroke="#d7dde6"></rect>
+          <text x="44" y="58" class="svg-title">会话模块围绕 transcript、外置工具结果和运行态快照，支撑 resume 与恢复后继续执行</text>
+
+          <rect x="52" y="102" width="160" height="108" rx="8" fill="#fff4df" stroke="#f2ca7c"></rect>
+          <text x="72" y="134" class="box-title">sessionStart</text>
+          <text x="72" y="160" class="box-text">处理首条消息</text>
+          <text x="72" y="180" class="box-text">执行启动 Hook</text>
+
+          <rect x="266" y="102" width="190" height="108" rx="8" fill="#fff4df" stroke="#f2ca7c"></rect>
+          <text x="286" y="134" class="box-title">sessionStorage</text>
+          <text x="286" y="160" class="box-text">定位会话文件</text>
+          <text x="286" y="180" class="box-text">读写 transcript</text>
+
+          <rect x="510" y="102" width="210" height="108" rx="8" fill="#fff4df" stroke="#f2ca7c"></rect>
+          <text x="530" y="134" class="box-title">sessionStoragePortable</text>
+          <text x="530" y="160" class="box-text">轻量读取头尾</text>
+          <text x="530" y="180" class="box-text">跨平台路径规整</text>
+
+          <rect x="774" y="102" width="190" height="108" rx="8" fill="#fff4df" stroke="#f2ca7c"></rect>
+          <text x="794" y="134" class="box-title">conversationRecovery</text>
+          <text x="794" y="160" class="box-text">反序列化消息</text>
+          <text x="794" y="180" class="box-text">识别中断上下文</text>
+
+          <rect x="1000" y="102" width="120" height="108" rx="8" fill="#fff4df" stroke="#f2ca7c"></rect>
+          <text x="1020" y="134" class="box-title">sessionRestore</text>
+          <text x="1020" y="160" class="box-text">重建状态</text>
+          <text x="1020" y="180" class="box-text">恢复工作区</text>
+
+          <rect x="298" y="238" width="210" height="48" rx="8" fill="#eef1f5" stroke="#ccd4df"></rect>
+          <text x="318" y="268" class="box-title">toolResultStorage：大体积工具结果外置</text>
+
+          <rect x="650" y="238" width="210" height="48" rx="8" fill="#eef1f5" stroke="#ccd4df"></rect>
+          <text x="670" y="268" class="box-title">sessionState：广播运行态变化</text>
+
+          <path d="M212 156 L264 156" stroke="#667085" stroke-width="2" fill="none" marker-end="url(#arrow3)"></path>
+          <path d="M456 156 L508 156" stroke="#667085" stroke-width="2" fill="none" marker-end="url(#arrow3)"></path>
+          <path d="M720 156 L772 156" stroke="#667085" stroke-width="2" fill="none" marker-end="url(#arrow3)"></path>
+          <path d="M964 156 L998 156" stroke="#667085" stroke-width="2" fill="none" marker-end="url(#arrow3)"></path>
+          <path d="M392 210 L400 236" stroke="#667085" stroke-width="2" fill="none" marker-end="url(#arrow3)"></path>
+          <path d="M870 210 C840 232 780 236 756 238" stroke="#667085" stroke-width="2" fill="none" marker-end="url(#arrow3)"></path>
+        </svg>
+      </div>
+
+      <h3>3. 配置、Hook 与权限链路</h3>
+      <div class="diagram-wrap">
+        <svg viewBox="0 0 1160 360" role="img" aria-label="配置 Hook 与权限链路图">
+          <defs>
+            <marker id="arrow4" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L0,6 L9,3 z" fill="#667085"></path>
+            </marker>
+          </defs>
+          <rect x="20" y="22" width="1120" height="316" rx="8" fill="#ffffff" stroke="#d7dde6"></rect>
+          <text x="44" y="58" class="svg-title">配置和 Hook 模块把项目策略、Agent 定义和权限规则转成运行期可执行的决策</text>
+
+          <rect x="58" y="96" width="170" height="126" rx="8" fill="#f1ebff" stroke="#cfbcff"></rect>
+          <text x="78" y="128" class="box-title">配置来源</text>
+          <text x="78" y="154" class="box-text">config</text>
+          <text x="78" y="174" class="box-text">markdownConfigLoader</text>
+          <text x="78" y="194" class="box-text">frontmatterParser</text>
+
+          <rect x="288" y="96" width="170" height="126" rx="8" fill="#f1ebff" stroke="#cfbcff"></rect>
+          <text x="308" y="128" class="box-title">Agent 与 Hook</text>
+          <text x="308" y="154" class="box-text">loadAgentsDir</text>
+          <text x="308" y="174" class="box-text">hooks</text>
+          <text x="308" y="194" class="box-text">sessionHooks</text>
+
+          <rect x="518" y="96" width="190" height="126" rx="8" fill="#f1ebff" stroke="#cfbcff"></rect>
+          <text x="538" y="128" class="box-title">Hook 快照</text>
+          <text x="538" y="154" class="box-text">hooksConfigSnapshot</text>
+          <text x="538" y="174" class="box-text">保留会话启动时策略</text>
+          <text x="538" y="194" class="box-text">避免恢复时配置漂移</text>
+
+          <rect x="768" y="96" width="170" height="126" rx="8" fill="#ffeceb" stroke="#f1aaa6"></rect>
+          <text x="788" y="128" class="box-title">权限规则</text>
+          <text x="788" y="154" class="box-text">permissionRuleParser</text>
+          <text x="788" y="174" class="box-text">toolValidationConfig</text>
+          <text x="788" y="194" class="box-text">permissionValidation</text>
+
+          <rect x="998" y="96" width="110" height="126" rx="8" fill="#eaf1ff" stroke="#9bb8ff"></rect>
+          <text x="1016" y="128" class="box-title">工具执行</text>
+          <text x="1016" y="154" class="box-text">读写</text>
+          <text x="1016" y="174" class="box-text">搜索</text>
+          <text x="1016" y="194" class="box-text">技能</text>
+
+          <rect x="386" y="262" width="390" height="48" rx="8" fill="#eef1f5" stroke="#ccd4df"></rect>
+          <text x="410" y="292" class="box-title">json / errors / sequential：配置解析、错误归类、异步任务串行执行</text>
+
+          <path d="M228 159 L286 159" stroke="#667085" stroke-width="2" fill="none" marker-end="url(#arrow4)"></path>
+          <path d="M458 159 L516 159" stroke="#667085" stroke-width="2" fill="none" marker-end="url(#arrow4)"></path>
+          <path d="M708 159 L766 159" stroke="#667085" stroke-width="2" fill="none" marker-end="url(#arrow4)"></path>
+          <path d="M938 159 L996 159" stroke="#667085" stroke-width="2" fill="none" marker-end="url(#arrow4)"></path>
+          <path d="M580 222 L580 260" stroke="#667085" stroke-width="2" fill="none" marker-end="url(#arrow4)"></path>
+          <path d="M778 286 C892 282 1002 252 1048 224" stroke="#667085" stroke-width="2" fill="none" marker-end="url(#arrow4)"></path>
+        </svg>
+      </div>
+    </section>
+
+    <section>
+      <h2>四、模块路径与功能分析表</h2>
+      <p>
+        下表将用户给出的模块名映射到仓库文件，并给出每个模块在系统里的定位。职责描述按代码语义归纳，
+        不是逐字翻译源码注释。
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>模块</th>
+            <th>文件路径</th>
+            <th>核心职责</th>
+            <th>主要协作对象</th>
+            <th>变更关注点</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="module-name">SkillTool</td>
+            <td class="path"><code>src/tools/SkillTool/SkillTool.ts</code></td>
+            <td>提供技能调用入口，让 Agent 能按技能名称、参数和上下文执行扩展能力。</td>
+            <td>工具注册体系、配置、权限、会话上下文。</td>
+            <td>参数协议变化会影响所有技能调用；需要保持错误提示可定位。</td>
+          </tr>
+          <tr>
+            <td class="module-name">sessionStorage</td>
+            <td class="path"><code>src/utils/sessionStorage.ts</code></td>
+            <td>负责会话 transcript 的标准读写、路径管理和会话文件枚举。</td>
+            <td><code>sessionStoragePortable</code>、<code>sessionRestore</code>、文件系统。</td>
+            <td>路径规则和文件格式必须兼容历史会话，否则 resume 会失效。</td>
+          </tr>
+          <tr>
+            <td class="module-name">sessionRestore</td>
+            <td class="path"><code>src/utils/sessionRestore.ts</code></td>
+            <td>从会话日志重建 Agent 状态、工具结果、工作区和恢复后的上下文。</td>
+            <td><code>conversationRecovery</code>、<code>toolResultStorage</code>、计划与附件模块。</td>
+            <td>恢复逻辑需要兼容中断会话、旧格式日志和工作区切换。</td>
+          </tr>
+          <tr>
+            <td class="module-name">toolResultStorage</td>
+            <td class="path"><code>src/utils/toolResultStorage.ts</code></td>
+            <td>把较大的工具结果从主 transcript 中拆出，降低会话文件膨胀和读取成本。</td>
+            <td>会话存储、恢复逻辑、工具执行结果。</td>
+            <td>外置引用和实际文件必须保持一致，避免恢复时找不到结果内容。</td>
+          </tr>
+          <tr>
+            <td class="module-name">sessionStoragePortable</td>
+            <td class="path"><code>src/utils/sessionStoragePortable.ts</code></td>
+            <td>提供轻量、跨平台的会话文件读取和路径规整能力，适合快速加载摘要或恢复入口。</td>
+            <td><code>sessionStorage</code>、<code>conversationRecovery</code>、项目路径。</td>
+            <td>读取头尾和路径 canonicalize 的行为会影响大 transcript 的性能与准确性。</td>
+          </tr>
+          <tr>
+            <td class="module-name">conversationRecovery</td>
+            <td class="path"><code>src/utils/conversationRecovery.ts</code></td>
+            <td>解析 JSONL transcript，恢复消息序列、技能状态、计划和中断上下文。</td>
+            <td><code>sessionRestore</code>、<code>sessionStart</code>、<code>toolResultStorage</code>。</td>
+            <td>反序列化必须对损坏行、旧字段和中断状态保持容错。</td>
+          </tr>
+          <tr>
+            <td class="module-name">sessionStart</td>
+            <td class="path"><code>src/utils/sessionStart.ts</code></td>
+            <td>处理会话初始输入，并在会话启动或 setup 阶段触发受控 Hook。</td>
+            <td><code>hooks</code>、<code>hooksConfigSnapshot</code>、插件 Hook。</td>
+            <td>启动 Hook 会影响首轮用户消息，需避免重复执行或越权执行。</td>
+          </tr>
+          <tr>
+            <td class="module-name">FileWriteTool</td>
+            <td class="path"><code>src/tools/FileWriteTool/FileWriteTool.ts</code></td>
+            <td>将完整文本写入指定文件，负责写入前的路径展开、权限检查和结果反馈。</td>
+            <td><code>file</code>、<code>fileRead</code>、<code>filesystem</code>。</td>
+            <td>写入行为直接改变用户文件，必须正确处理新建、覆盖、编码和修改时间。</td>
+          </tr>
+          <tr>
+            <td class="module-name">GrepTool</td>
+            <td class="path"><code>src/tools/GrepTool/GrepTool.ts</code></td>
+            <td>基于文本模式搜索文件内容，面向代码定位和批量匹配场景。</td>
+            <td><code>ripGrep</code>、<code>fsOperations</code>、权限检查。</td>
+            <td>搜索范围、隐藏文件、忽略规则和输出裁剪会影响结果可信度。</td>
+          </tr>
+          <tr>
+            <td class="module-name">GlobTool</td>
+            <td class="path"><code>src/tools/GlobTool/GlobTool.ts</code></td>
+            <td>按 glob 模式查找文件路径，适合先定位候选文件再交给读写工具处理。</td>
+            <td><code>glob</code>、<code>path</code>、<code>filesystem</code>。</td>
+            <td>模式解析和相对路径输出要稳定，否则会影响后续工具链。</td>
+          </tr>
+          <tr>
+            <td class="module-name">FileReadTool</td>
+            <td class="path"><code>src/tools/FileReadTool/FileReadTool.ts</code></td>
+            <td>读取文件内容并按工具协议返回，通常包含范围读取、行号和大小限制。</td>
+            <td><code>fileRead</code>、<code>file</code>、权限检查。</td>
+            <td>大文件、二进制文件和编码判断是主要边界。</td>
+          </tr>
+          <tr>
+            <td class="module-name">FileEditTool</td>
+            <td class="path"><code>src/tools/FileEditTool/FileEditTool.ts</code></td>
+            <td>对已有文件做局部替换或编辑，避免用整文件写入覆盖用户未预期内容。</td>
+            <td><code>file</code>、<code>fileRead</code>、<code>filesystem</code>。</td>
+            <td>匹配唯一性、换行符、缩进和并发修改检测会影响编辑安全性。</td>
+          </tr>
+          <tr>
+            <td class="module-name">path</td>
+            <td class="path"><code>src/utils/path.ts</code></td>
+            <td>封装路径展开、相对路径转换、目录推导和配置键规范化。</td>
+            <td>文件工具、配置、权限模块。</td>
+            <td>Windows、WSL、Unix 路径差异会影响权限判断和展示路径。</td>
+          </tr>
+          <tr>
+            <td class="module-name">file</td>
+            <td class="path"><code>src/utils/file.ts</code></td>
+            <td>提供文件存在性、读写、编码、换行符、路径展示、行号处理等通用能力。</td>
+            <td>文件工具、<code>fileRead</code>、<code>fsOperations</code>。</td>
+            <td>这是高复用基础模块，任何异常处理变化都可能扩散到多个工具。</td>
+          </tr>
+          <tr>
+            <td class="module-name">frontmatterParser</td>
+            <td class="path"><code>src/utils/frontmatterParser.ts</code></td>
+            <td>解析 Markdown 文件开头的结构化元数据，为配置和 Agent 定义提供元信息。</td>
+            <td><code>markdownConfigLoader</code>、<code>loadAgentsDir</code>。</td>
+            <td>解析失败应保留正文可用性，避免单个 frontmatter 错误阻断整份配置。</td>
+          </tr>
+          <tr>
+            <td class="module-name">loadAgentsDir</td>
+            <td class="path"><code>src/tools/AgentTool/loadAgentsDir.ts</code></td>
+            <td>从 Agent 目录加载定义文件，将 Markdown 配置转换为可运行的 Agent 描述。</td>
+            <td><code>frontmatterParser</code>、<code>markdownConfigLoader</code>、工具注册。</td>
+            <td>目录遍历、命名冲突和无效 Agent 文件需要清晰反馈。</td>
+          </tr>
+          <tr>
+            <td class="module-name">markdownConfigLoader</td>
+            <td class="path"><code>src/utils/markdownConfigLoader.ts</code></td>
+            <td>读取 Markdown 配置，把正文和 frontmatter 合并为统一配置对象。</td>
+            <td><code>frontmatterParser</code>、<code>json</code>。</td>
+            <td>配置字段校验要和调用方期望保持一致。</td>
+          </tr>
+          <tr>
+            <td class="module-name">fsOperations</td>
+            <td class="path"><code>src/utils/fsOperations.ts</code></td>
+            <td>集中封装文件系统操作，让工具层不直接绑定具体 fs 实现。</td>
+            <td>文件工具、搜索工具、文件基础模块。</td>
+            <td>抽象层改动会影响测试替身、真实文件系统和错误分类。</td>
+          </tr>
+          <tr>
+            <td class="module-name">bashProvider</td>
+            <td class="path"><code>src/utils/shell/bashProvider.ts</code></td>
+            <td>选择和描述可用 Bash/Shell 执行环境，为命令执行提供平台适配。</td>
+            <td><code>platform</code>、<code>env</code>、Shell 执行器。</td>
+            <td>Windows 和 WSL 环境下的可用 Shell 判断要特别谨慎。</td>
+          </tr>
+          <tr>
+            <td class="module-name">env</td>
+            <td class="path"><code>src/utils/env.ts</code></td>
+            <td>集中读取和解释环境变量，减少业务代码散落读取 process env。</td>
+            <td>配置、平台、工具执行。</td>
+            <td>环境变量默认值和布尔值解析会影响运行模式。</td>
+          </tr>
+          <tr>
+            <td class="module-name">filesystem</td>
+            <td class="path"><code>src/utils/permissions/filesystem.ts</code></td>
+            <td>判断路径是否在允许工作区内，并为读写工具生成权限检查结果。</td>
+            <td><code>permissionRuleParser</code>、文件工具、配置。</td>
+            <td>这是文件安全边界，任何放宽都需要明确业务理由。</td>
+          </tr>
+          <tr>
+            <td class="module-name">config</td>
+            <td class="path"><code>src/utils/config.ts</code></td>
+            <td>管理全局配置、项目配置、信任状态、默认值和配置文件路径。</td>
+            <td>工具、Hook、权限、会话、项目目录。</td>
+            <td>配置 schema 和默认值调整要兼容旧用户配置。</td>
+          </tr>
+          <tr>
+            <td class="module-name">hooks</td>
+            <td class="path"><code>src/utils/hooks.ts</code></td>
+            <td>提供 Hook 加载、执行、过滤和结果处理，是外部脚本介入运行流程的主入口。</td>
+            <td><code>hooksConfigSnapshot</code>、<code>sessionHooks</code>、配置。</td>
+            <td>Hook 执行涉及安全、超时、错误传播和输出注入，需要保持黑盒测试覆盖。</td>
+          </tr>
+          <tr>
+            <td class="module-name">settings/permissionValidation</td>
+            <td class="path"><code>src/utils/settings/permissionValidation.ts</code></td>
+            <td>校验配置中的权限规则是否符合工具语义和规则格式。</td>
+            <td><code>permissionRuleParser</code>、<code>toolValidationConfig</code>。</td>
+            <td>错误信息要能指导用户修复配置，而不是只给出技术异常。</td>
+          </tr>
+          <tr>
+            <td class="module-name">permissions/permissionRuleParser</td>
+            <td class="path"><code>src/utils/permissions/permissionRuleParser.ts</code></td>
+            <td>在字符串形式权限规则和结构化规则对象之间转换，并兼容历史工具命名。</td>
+            <td>权限校验、配置、文件系统权限判断。</td>
+            <td>转义和反转义必须可逆，否则保存后的规则可能无法恢复。</td>
+          </tr>
+          <tr>
+            <td class="module-name">settings/toolValidationConfig</td>
+            <td class="path"><code>src/utils/settings/toolValidationConfig.ts</code></td>
+            <td>描述不同工具的权限规则校验方式，例如文件模式工具、Bash 前缀工具和自定义校验。</td>
+            <td><code>permissionValidation</code>、工具定义。</td>
+            <td>新增工具时需要同步补充校验配置，避免权限配置接受无效规则。</td>
+          </tr>
+          <tr>
+            <td class="module-name">fileRead</td>
+            <td class="path"><code>src/utils/fileRead.ts</code></td>
+            <td>读取文件时补充编码、换行符等元数据，为显示和编辑保持原始格式提供依据。</td>
+            <td><code>file</code>、文件工具。</td>
+            <td>编码识别和换行符检测会影响后续写回是否产生无关 diff。</td>
+          </tr>
+          <tr>
+            <td class="module-name">json</td>
+            <td class="path"><code>src/utils/json.ts</code></td>
+            <td>提供 JSON、JSONC、JSONL 的安全解析和局部更新工具。</td>
+            <td>配置、会话恢复、Markdown 配置。</td>
+            <td>安全解析应返回可诊断错误，避免调用方直接崩溃。</td>
+          </tr>
+          <tr>
+            <td class="module-name">errors</td>
+            <td class="path"><code>src/utils/errors.ts</code></td>
+            <td>集中识别常见错误类型，帮助调用方按错误原因给出不同处理。</td>
+            <td>文件、配置、工具执行、恢复逻辑。</td>
+            <td>错误分类过粗会导致用户提示不准确，过细则会增加维护成本。</td>
+          </tr>
+          <tr>
+            <td class="module-name">hooksConfigSnapshot</td>
+            <td class="path"><code>src/utils/hooks/hooksConfigSnapshot.ts</code></td>
+            <td>捕获和读取会话级 Hook 配置快照，让恢复过程使用一致的 Hook 策略。</td>
+            <td><code>hooks</code>、<code>sessionStart</code>、配置。</td>
+            <td>快照必须明确区分托管 Hook、用户 Hook 和完全禁用 Hook 的状态。</td>
+          </tr>
+          <tr>
+            <td class="module-name">sessionState</td>
+            <td class="path"><code>src/utils/sessionState.ts</code></td>
+            <td>保存当前会话运行态，并向监听者广播元数据、权限模式等状态变化。</td>
+            <td>UI、会话恢复、权限模式、Agent 执行。</td>
+            <td>状态通知需要避免重复触发或遗漏关键变化。</td>
+          </tr>
+          <tr>
+            <td class="module-name">sequential</td>
+            <td class="path"><code>src/utils/sequential.ts</code></td>
+            <td>提供任务串行化执行能力，避免同类异步操作并发修改共享状态。</td>
+            <td>Hook、会话、文件或配置更新链路。</td>
+            <td>串行化边界过宽会影响性能，过窄会留下竞态。</td>
+          </tr>
+          <tr>
+            <td class="module-name">platform</td>
+            <td class="path"><code>src/utils/platform.ts</code></td>
+            <td>识别当前平台、Linux 发行版、WSL 版本和版本控制系统信息。</td>
+            <td><code>bashProvider</code>、路径、文件系统、配置。</td>
+            <td>平台识别错误会连锁影响 Shell 选择和路径处理。</td>
+          </tr>
+          <tr>
+            <td class="module-name">sessionHooks</td>
+            <td class="path"><code>src/utils/hooks/sessionHooks.ts</code></td>
+            <td>维护会话内注册的函数 Hook 和会话 Hook，为运行期扩展点提供存取 API。</td>
+            <td><code>hooks</code>、会话状态、工具执行。</td>
+            <td>Hook 增删需要以 sessionId 隔离，避免跨会话串扰。</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>五、模块边界与维护建议</h2>
+      <div class="legend">
+        <div class="legend-item">
+          <strong>工具层改动</strong>
+          优先检查参数 schema、权限检查、路径展开、错误提示和测试说明是否同步。
+        </div>
+        <div class="legend-item">
+          <strong>文件基础层改动</strong>
+          关注 Windows/Unix/WSL 差异，以及编码、换行符、隐藏文件和大文件边界。
+        </div>
+        <div class="legend-item">
+          <strong>会话层改动</strong>
+          必须验证旧 transcript、恢复中断、外置工具结果和工作区恢复路径。
+        </div>
+        <div class="legend-item">
+          <strong>配置与 Hook 改动</strong>
+          需要明确配置来源优先级，并验证 Hook 禁用、托管 Hook、用户 Hook 的组合场景。
+        </div>
+        <div class="legend-item">
+          <strong>权限层改动</strong>
+          任何解析或校验变化都应覆盖 allow、deny、ask、历史命名和转义字符。
+        </div>
+        <div class="legend-item">
+          <strong>通用工具改动</strong>
+          保持 API 小而稳定，错误返回要让上层能继续给出可读诊断。
+        </div>
+      </div>
+      <h3>建议的阅读顺序</h3>
+      <ul class="note-list">
+        <li>先看 <code>config</code>、<code>hooks</code>、<code>filesystem</code>，理解运行策略从哪里来、如何被约束。</li>
+        <li>再看 <code>FileReadTool</code>、<code>FileWriteTool</code>、<code>FileEditTool</code>、<code>GrepTool</code>、<code>GlobTool</code>，理解工具如何消费基础能力。</li>
+        <li>最后看 <code>sessionStorage</code>、<code>conversationRecovery</code>、<code>sessionRestore</code>，理解执行后的状态如何被持久化并恢复。</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>
