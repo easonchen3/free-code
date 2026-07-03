@@ -1,11 +1,8 @@
 /**
- * PowerShell-specific security analysis for command validation.
+ * PowerShell 命令安全分析模块。
  *
- * Detects dangerous patterns: code injection, download cradles, privilege
- * escalation, dynamic command names, COM objects, etc.
- *
- * All checks are AST-based. If parsing failed (valid=false), none of the
- * individual checks match and powershellCommandIsSafe returns 'ask'.
+ * 该文件基于 PowerShell 原生 AST 识别难以静态证明安全的命令形态，例如动态执行、下载后执行、提权、嵌套 PowerShell、COM/.NET 访问和持久化入口。
+ * 这里的策略不是直接拒绝命令，而是在风险无法被允许列表准确覆盖时返回 `ask`，让权限层把决策交给用户确认。
  */
 
 import {
@@ -27,11 +24,15 @@ import {
 } from '../../utils/powershell/parser.js'
 import { isClmAllowedType } from './clmTypes.js'
 
+/** PowerShell 安全检查的标准返回结构，用于告诉权限层继续后续规则、询问用户或直接允许。 */
 type PowerShellSecurityResult = {
+  /** 当前规则的处理结果；`passthrough` 表示继续检查，`ask` 表示需要用户确认，`allow` 预留给明确放行场景。 */
   behavior: 'passthrough' | 'ask' | 'allow'
+  /** 需要询问用户时展示的风险说明。 */
   message?: string
 }
 
+/** 可被识别为 PowerShell 运行时的可执行文件名，统一用小写形态匹配。 */
 const POWERSHELL_EXECUTABLES = new Set([
   'pwsh',
   'pwsh.exe',
@@ -40,15 +41,18 @@ const POWERSHELL_EXECUTABLES = new Set([
 ])
 
 /**
- * Extracts the base executable name from a command, handling full paths
- * like /usr/bin/pwsh, C:\Windows\...\powershell.exe, or .\pwsh.
+ * 判断命令名是否指向 PowerShell 可执行文件。
+ *
+ * @param name 命令名或带目录的可执行文件路径。
+ * @returns 名称或路径 basename 是 pwsh/powershell 时返回 true。
  */
 function isPowerShellExecutable(name: string): boolean {
+  // 1. 先用原始命令名的小写形式匹配，覆盖直接写 pwsh/powershell 的场景。
   const lower = name.toLowerCase()
   if (POWERSHELL_EXECUTABLES.has(lower)) {
     return true
   }
-  // Extract basename from paths (both / and \ separators)
+  // 2. 如果传入的是路径，则同时兼容 POSIX `/` 和 Windows `\` 分隔符提取 basename。
   const lastSep = Math.max(lower.lastIndexOf('/'), lower.lastIndexOf('\\'))
   if (lastSep >= 0) {
     return POWERSHELL_EXECUTABLES.has(lower.slice(lastSep + 1))
@@ -57,39 +61,35 @@ function isPowerShellExecutable(name: string): boolean {
 }
 
 /**
- * Alternative parameter-prefix characters that PowerShell accepts as equivalent
- * to ASCII hyphen-minus (U+002D). PowerShell's tokenizer (SpecialCharacters.IsDash)
- * and powershell.exe's CommandLineParameterParser both accept all four dash
- * characters plus Windows PowerShell 5.1's `/` parameter delimiter.
- * Extent.Text preserves the raw character; transformCommandAst uses ce.text for
- * CommandParameterAst elements, so these reach us unchanged.
+ * PowerShell 接受的非标准参数前缀集合。
+ *
+ * PowerShell 词法器会把这些字符视作普通 `-` 的等价写法，Windows PowerShell 5.1 还接受 `/` 作为参数分隔符；AST 原文会保留这些字符，因此安全规则必须主动归一化。
  */
 const PS_ALT_PARAM_PREFIXES = new Set([
-  '/', // Windows PowerShell 5.1 (powershell.exe, not pwsh 7+)
-  '\u2013', // en-dash
-  '\u2014', // em-dash
-  '\u2015', // horizontal bar
+  '/', // Windows PowerShell 5.1 的参数分隔符，pwsh 7+ 通常不使用。
+  '\u2013', // 短破折号。
+  '\u2014', // 长破折号。
+  '\u2015', // 横线字符。
 ])
 
 /**
- * Wrapper around commandHasArgAbbreviation that also matches alternative
- * parameter prefixes (`/`, en-dash, em-dash, horizontal-bar). PowerShell's
- * tokenizer (SpecialCharacters.IsDash) accepts these for both powershell.exe
- * args AND cmdlet parameters, so use this for ALL PS param checks — not just
- * pwsh.exe invocations. Previously checkComObject/checkStartProcess/
- * checkDangerousFilePathExecution/checkForEachMemberName used bare
- * commandHasArgAbbreviation, so `Start-Process foo –Verb RunAs` bypassed.
+ * 按 PowerShell 参数缩写规则检查命令参数，并兼容非标准 dash 前缀。
+ *
+ * @param cmd 已解析出的命令元素。
+ * @param fullParam 完整参数名，例如 `-encodedcommand`。
+ * @param minPrefix 允许匹配的最短缩写，例如 `-e`。
+ * @returns 参数以标准或非标准前缀命中缩写规则时返回 true。
  */
 function psExeHasParamAbbreviation(
   cmd: ParsedCommandElement,
   fullParam: string,
   minPrefix: string,
 ): boolean {
+  // 1. 先按标准 `-` 参数前缀检查，覆盖最常见的 PowerShell 参数写法。
   if (commandHasArgAbbreviation(cmd, fullParam, minPrefix)) {
     return true
   }
-  // Normalize alternative prefixes to `-` and re-check. Build a synthetic cmd
-  // with normalized args; commandHasArgAbbreviation handles colon-value split.
+  // 2. 再把 PowerShell 也接受的替代前缀归一化为 `-`，避免绕过风险参数检测。
   const normalized: ParsedCommandElement = {
     ...cmd,
     args: cmd.args.map(a =>
@@ -100,12 +100,15 @@ function psExeHasParamAbbreviation(
 }
 
 /**
- * Checks if a PowerShell command uses Invoke-Expression or its alias (iex).
- * These are equivalent to eval and can execute arbitrary code.
+ * 检查命令是否使用 `Invoke-Expression` 或别名 `iex`。
+ *
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 命中动态求值命令时返回 ask，否则继续后续规则。
  */
 function checkInvokeExpression(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. `Invoke-Expression` 等同于 eval，无法仅通过参数允许列表证明安全。
   if (hasCommandNamed(parsed, 'Invoke-Expression')) {
     return {
       behavior: 'ask',
@@ -117,36 +120,20 @@ function checkInvokeExpression(
 }
 
 /**
- * Checks for dynamic command invocation where the command name itself is an
- * expression that cannot be statically resolved.
+ * 检查命令名本身是否来自运行时表达式。
  *
- * PoCs:
- *   & ${function:Invoke-Expression} 'payload'  — VariableExpressionAst
- *   & ('iex','x')[0] 'payload'                 — IndexExpressionAst → 'Other'
- *   & ('i'+'ex') 'payload'                     — BinaryExpressionAst → 'Other'
- *
- * In all cases cmd.name is the literal extent text (e.g. "('iex','x')[0]"),
- * which doesn't match hasCommandNamed('Invoke-Expression'). At runtime
- * PowerShell evaluates the expression to a command name and invokes it.
- *
- * Legitimate command names are ALWAYS StringConstantExpressionAst (mapped to
- * 'StringConstant'): `Get-Process`, `git`, `ls`. Any other element type in
- * name position is dynamic. Rather than denylisting dynamic types (fragile —
- * mapElementType's default case maps unknown AST types to 'Other', which a
- * `=== 'Variable'` check misses), we allowlist 'StringConstant'.
- *
- * elementTypes[0] is the command-name element (transformCommandAst pushes it
- * first, before arg elements). The `!== undefined` guard preserves fail-open
- * when elementTypes is absent (parse-detail unavailable — if parsing failed
- * entirely, valid=false already returns 'ask' earlier in the chain).
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 命令名不是静态字符串且无法安全解析时返回 ask。
  */
 function checkDynamicCommandName(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. 遍历所有命令节点，只对真正的 CommandAst 判断命令名形态。
   for (const cmd of getAllCommands(parsed)) {
     if (cmd.elementType !== 'CommandAst') {
       continue
     }
+    // 2. 合法命令名应是静态字符串；变量、索引、拼接等表达式会在运行时解析成真实命令。
     const nameElementType = cmd.elementTypes?.[0]
     if (nameElementType !== undefined && nameElementType !== 'StringConstant') {
       return {
@@ -160,14 +147,18 @@ function checkDynamicCommandName(
 }
 
 /**
- * Checks for encoded command parameters which obscure intent.
- * These are commonly used in malware to bypass security tools.
+ * 检查嵌套 PowerShell 是否使用编码命令参数。
+ *
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns PowerShell 可执行文件携带 `-EncodedCommand` 缩写时返回 ask。
  */
 function checkEncodedCommand(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. 只有 PowerShell 进程本身理解 encoded command，因此先限定命令名。
   for (const cmd of getAllCommands(parsed)) {
     if (isPowerShellExecutable(cmd.name)) {
+      // 2. 编码参数隐藏真实意图，必须询问用户确认。
       if (psExeHasParamAbbreviation(cmd, '-encodedcommand', '-e')) {
         return {
           behavior: 'ask',
@@ -180,18 +171,15 @@ function checkEncodedCommand(
 }
 
 /**
- * Checks for PowerShell re-invocation (nested pwsh/powershell process).
+ * 检查命令是否重新启动 PowerShell 子进程。
  *
- * Any PowerShell executable in command position is flagged — not just
- * -Command/-File. Bare `pwsh` receiving stdin (`Get-Content x | pwsh`) or
- * a positional script path executes arbitrary code with none of the explicit
- * flags present. Same unvalidatable-nested-process reasoning as
- * checkStartProcess vector 2: we cannot statically analyze what the child
- * process will run.
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 发现嵌套 PowerShell 进程时返回 ask。
  */
 function checkPwshCommandOrFile(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. 只要命令位是 PowerShell 可执行文件，就可能通过 stdin、位置参数或脚本文件执行未解析代码。
   for (const cmd of getAllCommands(parsed)) {
     if (isPowerShellExecutable(cmd.name)) {
       return {
@@ -205,13 +193,7 @@ function checkPwshCommandOrFile(
 }
 
 /**
- * Checks for download cradle patterns - common malware techniques
- * that download and execute remote code.
- *
- * Per-statement: catches piped cradles (`IWR ... | IEX`).
- * Cross-statement: catches split cradles (`$r = IWR ...; IEX $r.Content`).
- * The cross-statement case is already blocked by checkInvokeExpression (which
- * scans all statements), but this check improves the warning message.
+ * 下载器命令集合，用于识别“下载远端内容”这半段风险链路。
  */
 const DOWNLOADER_NAMES = new Set([
   'invoke-webrequest',
@@ -219,22 +201,42 @@ const DOWNLOADER_NAMES = new Set([
   'invoke-restmethod',
   'irm',
   'new-object',
-  'start-bitstransfer', // MITRE T1197
+  'start-bitstransfer', // BITS 文件传输能力，常见于持久化或下载载荷场景。
 ])
 
+/**
+ * 判断命令名是否属于下载器集合。
+ *
+ * @param name 待检查的命令名。
+ * @returns 命令可以获取远端内容时返回 true。
+ */
 function isDownloader(name: string): boolean {
+  // 1. 下载器名称统一按小写匹配，兼容 PowerShell 命令大小写不敏感的语义。
   return DOWNLOADER_NAMES.has(name.toLowerCase())
 }
 
+/**
+ * 判断命令名是否是 `Invoke-Expression` 或 `iex`。
+ *
+ * @param name 待检查的命令名。
+ * @returns 命令会执行字符串内容时返回 true。
+ */
 function isIex(name: string): boolean {
+  // 1. 归一化大小写后同时匹配完整命令和常用别名。
   const lower = name.toLowerCase()
   return lower === 'invoke-expression' || lower === 'iex'
 }
 
+/**
+ * 检查“下载后立即执行”的 cradle 组合。
+ *
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 同一语句或跨语句同时出现下载器和 IEX 时返回 ask。
+ */
 function checkDownloadCradles(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
-  // Per-statement: piped cradle (IWR ... | IEX)
+  // 1. 先按单条语句检查管道式 cradle，例如 `IWR ... | IEX`。
   for (const statement of parsed.statements) {
     const cmds = statement.commands
     if (cmds.length < 2) {
@@ -250,8 +252,7 @@ function checkDownloadCradles(
     }
   }
 
-  // Cross-statement: split cradle ($r = IWR ...; IEX $r.Content).
-  // No new false positives: if IEX is present, checkInvokeExpression already asks.
+  // 2. 再检查跨语句拆开的 cradle，用更准确的提示解释“下载并执行”风险。
   const all = getAllCommands(parsed)
   if (all.some(c => isDownloader(c.name)) && all.some(c => isIex(c.name))) {
     return {
@@ -264,31 +265,25 @@ function checkDownloadCradles(
 }
 
 /**
- * Checks for standalone download utilities — LOLBAS tools commonly used to
- * fetch payloads. Unlike checkDownloadCradles (which requires download + IEX
- * in-pipeline), this flags the download operation itself.
+ * 检查独立下载工具调用。
  *
- * Start-BitsTransfer: always a file transfer (MITRE T1197).
- * certutil -urlcache: classic LOLBAS download. Only flagged with -urlcache;
- * bare `certutil` has many legitimate cert-management uses.
- * bitsadmin /transfer: legacy BITS download (pre-PowerShell).
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 命令本身具备下载文件能力且无法证明用途安全时返回 ask。
  */
 function checkDownloadUtilities(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. 对每个命令做名称级匹配，覆盖 PowerShell cmdlet 和 Windows 原生命令。
   for (const cmd of getAllCommands(parsed)) {
     const lower = cmd.name.toLowerCase()
-    // Start-BitsTransfer is purpose-built for file transfer — no safe variant.
+    // 2. Start-BitsTransfer 语义就是文件传输，不区分更细的安全子场景。
     if (lower === 'start-bitstransfer') {
       return {
         behavior: 'ask',
         message: 'Command downloads files via BITS transfer',
       }
     }
-    // certutil / certutil.exe — only when -urlcache is present. certutil has
-    // many non-download uses (cert store queries, encoding, etc.).
-    // certutil.exe accepts both -urlcache and /urlcache per standard Windows
-    // utility convention — check both forms (bitsadmin below does the same).
+    // 3. certutil 只有携带 urlcache 时才按下载风险处理，避免误伤证书查询等正常用途。
     if (lower === 'certutil' || lower === 'certutil.exe') {
       const hasUrlcache = cmd.args.some(a => {
         const la = a.toLowerCase()
@@ -301,7 +296,7 @@ function checkDownloadUtilities(
         }
       }
     }
-    // bitsadmin /transfer — legacy BITS CLI, same threat as Start-BitsTransfer.
+    // 4. bitsadmin 的 /transfer 是旧版 BITS 下载入口，风险等同于 Start-BitsTransfer。
     if (lower === 'bitsadmin' || lower === 'bitsadmin.exe') {
       if (cmd.args.some(a => a.toLowerCase() === '/transfer')) {
         return {
@@ -315,12 +310,15 @@ function checkDownloadUtilities(
 }
 
 /**
- * Checks for Add-Type usage which compiles and loads .NET code at runtime.
- * This can be used to execute arbitrary compiled code.
+ * 检查是否通过 `Add-Type` 动态编译并加载 .NET 代码。
+ *
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 命中 `Add-Type` 时返回 ask。
  */
 function checkAddType(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. Add-Type 会把源码编译进当前运行时，静态命令允许列表无法覆盖其真实行为。
   if (hasCommandNamed(parsed, 'Add-Type')) {
     return {
       behavior: 'ask',
@@ -331,25 +329,20 @@ function checkAddType(
 }
 
 /**
- * Checks for New-Object -ComObject. COM objects like WScript.Shell,
- * Shell.Application, MMC20.Application, Schedule.Service, Msxml2.XMLHTTP
- * have their own execution/download capabilities — no IEX required.
+ * 检查 `New-Object` 是否创建 COM 对象或受限语言模式外的 .NET 类型。
  *
- * We can't enumerate all dangerous ProgIDs, so flag any -ComObject. Object
- * creation alone is inert, but the prompt should warn the user that COM
- * instantiation is an execution primitive. Method invocation on the result
- * (.Run(), .Exec()) is separately caught by checkMemberInvocations.
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 命中 COM 创建或不在 CLM allowlist 的类型创建时返回 ask。
  */
 function checkComObject(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. 只分析 New-Object；其他命令交给对应规则处理。
   for (const cmd of getAllCommands(parsed)) {
     if (cmd.name.toLowerCase() !== 'new-object') {
       continue
     }
-    // -ComObject min abbrev is -com (New-Object params: -TypeName, -ComObject,
-    // -ArgumentList, -Property, -Strict; -co is ambiguous in PS5.1 due to
-    // common params like -Confirm, so use -com).
+    // 2. `-ComObject` 可以访问带执行或下载能力的 COM 组件，最短安全缩写按 `-com` 判断。
     if (psExeHasParamAbbreviation(cmd, '-comobject', '-com')) {
       return {
         behavior: 'ask',
@@ -357,17 +350,12 @@ function checkComObject(
           'Command instantiates a COM object which may have execution capabilities',
       }
     }
-    // SECURITY: checkTypeLiterals only sees [bracket] syntax from
-    // parsed.typeLiterals. `New-Object System.Net.WebClient` passes the type
-    // as a STRING ARG (StringConstantExpressionAst), not a TypeExpressionAst,
-    // so CLM never fires. Extract -TypeName (named, colon-bound, or
-    // positional-0) and run through isClmAllowedType. Closes attackVectors D4.
+    // 3. New-Object 的 TypeName 可能只是字符串参数，不会进入 typeLiterals，因此需要从参数绑定里提取。
     let typeName: string | undefined
     for (let i = 0; i < cmd.args.length; i++) {
       const a = cmd.args[i]!
       const lower = a.toLowerCase()
-      // -TypeName abbrev: -t is unambiguous (no other New-Object -t* params).
-      // Handle colon-bound form first: -TypeName:Foo.Bar
+      // 4. 先处理 `-TypeName:Foo.Bar` 这类冒号绑定形式。
       if (lower.startsWith('-t') && lower.includes(':')) {
         const colonIdx = a.indexOf(':')
         const paramPart = lower.slice(0, colonIdx)
@@ -376,7 +364,7 @@ function checkComObject(
           break
         }
       }
-      // Space-separated form: -TypeName Foo.Bar
+      // 5. 再处理 `-TypeName Foo.Bar` 这种空格分隔形式。
       if (
         lower.startsWith('-t') &&
         '-typename'.startsWith(lower) &&
@@ -386,38 +374,37 @@ function checkComObject(
         break
       }
     }
-    // Positional-0 binds to -TypeName (NetParameterSet default). Named params
-    // (-Strict, -ArgumentList, -Property, -ComObject) may appear before the
-    // positional TypeName, so scan past them to find the first non-consumed arg.
+    // 6. 如果没有命名参数，则按 New-Object 默认绑定规则寻找第一个未被参数消费的位置参数。
     if (typeName === undefined) {
-      // New-Object named params that consume a following value argument
+      // 7. 这些命名参数会消费后一个值，扫描位置参数时需要跳过。
       const VALUE_PARAMS = new Set(['-argumentlist', '-comobject', '-property'])
-      // Switch params (no value argument)
+      // 8. switch 参数不消费后续值，只跳过自身。
       const SWITCH_PARAMS = new Set(['-strict'])
       for (let i = 0; i < cmd.args.length; i++) {
         const a = cmd.args[i]!
         if (a.startsWith('-')) {
           const lower = a.toLowerCase()
-          // Skip -TypeName variants (already handled by named-param loop above)
+          // 9. TypeName 命名形式前面已经处理，这里只跳过其值避免重复识别。
           if (lower.startsWith('-t') && '-typename'.startsWith(lower)) {
-            i++ // skip value
+            i++ // 跳过 TypeName 的值。
             continue
           }
-          // Colon-bound form: -Param:Value (single token, no skip needed)
+          // 10. 冒号绑定的参数值已经在同一 token 内，不需要额外跳过。
           if (lower.includes(':')) continue
           if (SWITCH_PARAMS.has(lower)) continue
           if (VALUE_PARAMS.has(lower)) {
-            i++ // skip value
+            i++ // 跳过被命名参数消费的值。
             continue
           }
-          // Unknown param — skip conservatively
+          // 11. 未知参数保守跳过，避免把参数名误当作类型名。
           continue
         }
-        // First non-dash arg is the positional TypeName
+        // 12. 第一个非参数 token 按位置绑定为 TypeName。
         typeName = a
         break
       }
     }
+    // 13. 最后用受限语言模式 allowlist 判断该 .NET 类型是否可接受。
     if (typeName !== undefined && !isClmAllowedType(typeName)) {
       return {
         behavior: 'ask',
@@ -429,35 +416,22 @@ function checkComObject(
 }
 
 /**
- * Checks for DANGEROUS_SCRIPT_BLOCK_CMDLETS invoked with -FilePath (or
- * -LiteralPath). These run a script file — arbitrary code execution with no
- * ScriptBlockAst in the tree.
+ * 检查危险脚本块 cmdlet 是否通过文件路径执行脚本。
  *
- * checkScriptBlockInjection only fires when hasScriptBlocks is true. With
- * -FilePath there is no ScriptBlockAst, so DANGEROUS_SCRIPT_BLOCK_CMDLETS is
- * never consulted. This check closes that gap for the -FilePath vector.
- *
- * Cmdlets in DANGEROUS_SCRIPT_BLOCK_CMDLETS that accept -FilePath:
- *   Invoke-Command   -FilePath             (icm alias via COMMON_ALIASES)
- *   Start-Job        -FilePath, -LiteralPath
- *   Start-ThreadJob  -FilePath
- *   Register-ScheduledJob -FilePath
- * The *-PSSession and Register-*Event entries do not accept -FilePath.
- *
- * -f is unambiguous for -FilePath on all four (no other -f* params).
- * -l is unambiguous for -LiteralPath on Start-Job; harmless no-op on the
- * others (no -l* params to collide with).
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 命中 `-FilePath`、`-LiteralPath` 或位置脚本路径时返回 ask。
  */
-
 function checkDangerousFilePathExecution(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. 先把别名解析成规范 cmdlet 名称，只检查可通过文件路径执行脚本的命令。
   for (const cmd of getAllCommands(parsed)) {
     const lower = cmd.name.toLowerCase()
     const resolved = COMMON_ALIASES[lower]?.toLowerCase() ?? lower
     if (!FILEPATH_EXECUTION_CMDLETS.has(resolved)) {
       continue
     }
+    // 2. 命名参数形式会直接让目标 cmdlet 加载并执行脚本文件。
     if (
       psExeHasParamAbbreviation(cmd, '-filepath', '-f') ||
       psExeHasParamAbbreviation(cmd, '-literalpath', '-l')
@@ -467,11 +441,7 @@ function checkDangerousFilePathExecution(
         message: `${cmd.name} -FilePath executes an arbitrary script file`,
       }
     }
-    // Positional binding: `Start-Job script.ps1` binds position-0 to
-    // -FilePath via FilePathParameterSet resolution (ScriptBlock args select
-    // ScriptBlockParameterSet instead). Same pattern as checkForEachMemberName:
-    // any non-dash StringConstant is a potential -FilePath. Over-flagging
-    // (e.g., `Start-Job -Name foo` where `foo` is StringConstant) is fail-safe.
+    // 3. 位置参数也可能绑定到 FilePath；宁可提示用户，也不静默放过脚本文件执行。
     for (let i = 0; i < cmd.args.length; i++) {
       const argType = cmd.elementTypes?.[i + 1]
       const arg = cmd.args[i]
@@ -487,25 +457,22 @@ function checkDangerousFilePathExecution(
 }
 
 /**
- * Checks for ForEach-Object -MemberName. Invokes a method by string name on
- * every piped object — semantically equivalent to `| % { $_.Method() }` but
- * without any ScriptBlockAst or InvokeMemberExpressionAst in the tree.
+ * 检查 `ForEach-Object -MemberName` 这类按字符串调用成员的方法。
  *
- * PoC: `Get-Process | ForEach-Object -MemberName Kill` → kills all processes.
- * checkScriptBlockInjection misses it (no script block); checkMemberInvocations
- * misses it (no .Method() syntax). Aliases `%` and `foreach` resolve via
- * COMMON_ALIASES.
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 命中命名或位置形式的 MemberName 调用时返回 ask。
  */
 function checkForEachMemberName(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. 解析 foreach 相关别名后，只处理 ForEach-Object。
   for (const cmd of getAllCommands(parsed)) {
     const lower = cmd.name.toLowerCase()
     const resolved = COMMON_ALIASES[lower]?.toLowerCase() ?? lower
     if (resolved !== 'foreach-object') {
       continue
     }
-    // ForEach-Object params starting with -m: only -MemberName. -m is unambiguous.
+    // 2. `-MemberName` 会按字符串调用对象方法，AST 中不会出现普通方法调用节点。
     if (psExeHasParamAbbreviation(cmd, '-membername', '-m')) {
       return {
         behavior: 'ask',
@@ -513,11 +480,7 @@ function checkForEachMemberName(
           'ForEach-Object -MemberName invokes methods by string name which cannot be validated',
       }
     }
-    // PS7+: `ForEach-Object Kill` binds a positional string arg to
-    // -MemberName via MemberSet parameter-set resolution (ScriptBlock args
-    // select ScriptBlockSet instead). Scan ALL args — `-Verbose Kill` or
-    // `-ErrorAction Stop Kill` still binds Kill positionally. Any non-dash
-    // StringConstant is a potential -MemberName; over-flagging is fail-safe.
+    // 3. PS7 会把位置字符串绑定到 MemberName，因此所有非参数字符串都要按潜在方法名处理。
     for (let i = 0; i < cmd.args.length; i++) {
       const argType = cmd.elementTypes?.[i + 1]
       const arg = cmd.args[i]
@@ -534,30 +497,21 @@ function checkForEachMemberName(
 }
 
 /**
- * Checks for dangerous Start-Process patterns.
+ * 检查 `Start-Process` 的提权和嵌套 PowerShell 风险。
  *
- * Two vectors:
- * 1. `-Verb RunAs` — privilege escalation (UAC prompt).
- * 2. Launching a PowerShell executable — nested invocation.
- * `Start-Process pwsh -ArgumentList "-e <b64>"` evades
- * checkEncodedCommand/checkPwshCommandOrFile because cmd.name is
- * `Start-Process`, not `pwsh`. The `-e` lives inside the -ArgumentList
- * string value and is never parsed as a param on the outer command.
- * Rather than parse -ArgumentList contents (fragile — it's an opaque
- * string or array), flag any Start-Process whose target is a PS
- * executable: the nested invocation is unvalidatable by construction.
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 请求 RunAs 提权或启动 PowerShell 子进程时返回 ask。
  */
 function checkStartProcess(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. 只处理 Start-Process 及其常见别名。
   for (const cmd of getAllCommands(parsed)) {
     const lower = cmd.name.toLowerCase()
     if (lower !== 'start-process' && lower !== 'saps' && lower !== 'start') {
       continue
     }
-    // Vector 1: -Verb RunAs (space or colon syntax).
-    // Space syntax: psExeHasParamAbbreviation finds -Verb/-v, then scan args
-    // for a bare 'runas' token.
+    // 2. 空格分隔的 `-Verb RunAs` 会触发 UAC 提权，需要用户显式确认。
     if (
       psExeHasParamAbbreviation(cmd, '-Verb', '-v') &&
       cmd.args.some(a => a.toLowerCase() === 'runas')
@@ -567,19 +521,10 @@ function checkStartProcess(
         message: 'Command requests elevated privileges',
       }
     }
-    // Colon syntax — two layers:
-    // (a) Structural: PR #23554 added children[] for colon-bound param args.
-    //     children[i] = [{type, text}] for the bound value. Check if any
-    //     -v*-prefixed param has a child whose text normalizes (strip
-    //     quotes/backtick/whitespace) to 'runas'. Robust against arbitrary
-    //     quoting the regex can't anticipate.
-    // (b) Regex fallback: for parsed output without children[] or as
-    //     defense-in-depth. -Verb:'RunAs', -Verb:"RunAs", -Verb:`runas all
-    //     bypassed the old /...:runas$/ pattern because the quote/tick broke
-    //     the match.
+    // 3. 冒号绑定的 `-Verb:RunAs` 优先用 children 结构判断，能覆盖复杂引号和反引号。
     if (cmd.children) {
       for (let i = 0; i < cmd.args.length; i++) {
-        // Strip backticks before matching param name (bug #14): -V`erb:RunAs
+        // 4. 参数名里可能插入反引号，先移除再判断是否是 Verb 参数。
         const argClean = cmd.args[i]!.replace(/`/g, '')
         if (!/^[-\u2013\u2014\u2015/]v[a-z]*:/i.test(argClean)) continue
         const kids = cmd.children[i]
@@ -594,9 +539,10 @@ function checkStartProcess(
         }
       }
     }
+    // 5. 对没有 children 细节的解析结果，再用正则兜底识别冒号绑定 RunAs。
     if (
       cmd.args.some(a => {
-        // Strip backticks before matching (bug #14 / review nit #2)
+        // 6. 兜底正则同样先去掉反引号，避免简单规避。
         const clean = a.replace(/`/g, '')
         return /^[-\u2013\u2014\u2015/]v[a-z]*:['"` ]*runas['"` ]*$/i.test(
           clean,
@@ -608,16 +554,7 @@ function checkStartProcess(
         message: 'Command requests elevated privileges',
       }
     }
-    // Vector 2: Start-Process targeting a PowerShell executable.
-    // Target is either the first positional arg or the value after -FilePath.
-    // Scan all args — any PS-executable token present is treated as the launch
-    // target. Known false-positive: path-valued params (-WorkingDirectory,
-    // -RedirectStandard*) whose basename is pwsh/powershell —
-    // isPowerShellExecutable extracts basenames from paths, so
-    // `-WorkingDirectory C:\projects\pwsh` triggers. Accepted trade-off:
-    // Start-Process is not in CMDLET_ALLOWLIST (always prompts regardless),
-    // result is ask not reject, and correctly parsing Start-Process parameter
-    // binding is fragile. Strip quotes the parser may have preserved.
+    // 7. Start-Process 启动 PowerShell 后子进程参数不再可静态验证，因此只要目标像 PowerShell 就询问。
     for (const arg of cmd.args) {
       const stripped = arg.replace(/^['"]|['"]$/g, '')
       if (isPowerShellExecutable(stripped)) {
@@ -633,8 +570,9 @@ function checkStartProcess(
 }
 
 /**
- * Cmdlets where script blocks are safe (filtering/output cmdlets).
- * Script blocks piped to these are just predicates or projections, not arbitrary execution.
+ * 可安全消费脚本块的 cmdlet 集合。
+ *
+ * 这些命令把脚本块用于过滤、排序或投影，不把它当作通用执行入口。
  */
 const SAFE_SCRIPT_BLOCK_CMDLETS = new Set([
   'where-object',
@@ -645,32 +583,25 @@ const SAFE_SCRIPT_BLOCK_CMDLETS = new Set([
   'format-list',
   'format-wide',
   'format-custom',
-  // NOT foreach-object — its block is arbitrary script, not a predicate.
-  // getAllCommands recurses so commands inside the block ARE checked, but
-  // non-command AST nodes (AssignmentStatementAst etc.) are invisible to it.
-  // See powershellPermissions.ts step-5 hasScriptBlocks guard.
+  // ForEach-Object 的脚本块是任意脚本而不是纯谓词，因此不能列入安全集合。
 ])
 
 /**
- * Checks for script block injection patterns where script blocks
- * appear in suspicious contexts that could execute arbitrary code.
+ * 检查脚本块是否出现在可执行任意代码的上下文。
  *
- * Script blocks used with safe filtering/output cmdlets (Where-Object,
- * Sort-Object, Select-Object, Group-Object) are allowed.
- * Script blocks used with dangerous cmdlets (Invoke-Command, Invoke-Expression,
- * Start-Job, etc.) are flagged.
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 脚本块被危险 cmdlet 消费，或无法证明只是过滤/投影用途时返回 ask。
  */
 function checkScriptBlockInjection(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. 没有脚本块时无需进入该规则。
   const security = deriveSecurityFlags(parsed)
   if (!security.hasScriptBlocks) {
     return { behavior: 'passthrough' }
   }
 
-  // Check all commands in the parsed result. If any command is in the
-  // dangerous set, flag it. If all commands with script blocks are in
-  // the safe set (or the allowlist), allow it.
+  // 2. 危险 cmdlet 携带脚本块时，通常意味着远程执行、作业执行或动态执行。
   for (const cmd of getAllCommands(parsed)) {
     const lower = cmd.name.toLowerCase()
     if (DANGEROUS_SCRIPT_BLOCK_CMDLETS.has(lower)) {
@@ -682,19 +613,19 @@ function checkScriptBlockInjection(
     }
   }
 
-  // Check if all commands are either safe script block consumers or don't use script blocks
+  // 3. 如果所有命令都属于安全消费脚本块的集合，则继续后续规则。
   const allCommandsSafe = getAllCommands(parsed).every(cmd => {
     const lower = cmd.name.toLowerCase()
-    // Safe filtering/output cmdlets
+    // 4. 直接命中安全集合的 cmdlet 可以放行。
     if (SAFE_SCRIPT_BLOCK_CMDLETS.has(lower)) {
       return true
     }
-    // Resolve aliases
+    // 5. 别名需要先解析后再判断是否属于安全集合。
     const alias = COMMON_ALIASES[lower]
     if (alias && SAFE_SCRIPT_BLOCK_CMDLETS.has(alias.toLowerCase())) {
       return true
     }
-    // Unknown command with script blocks present — flag as potentially dangerous
+    // 6. 未知命令携带脚本块时无法证明只是谓词或投影，按风险处理。
     return false
   })
 
@@ -709,11 +640,15 @@ function checkScriptBlockInjection(
 }
 
 /**
- * AST-only check: Detects subexpressions $() which can hide command execution.
+ * 检查是否存在 `$()` 子表达式。
+ *
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 存在子表达式时返回 ask。
  */
 function checkSubExpressions(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. 子表达式可以把命令执行隐藏在参数或字符串拼接中。
   if (deriveSecurityFlags(parsed).hasSubExpressions) {
     return {
       behavior: 'ask',
@@ -724,13 +659,15 @@ function checkSubExpressions(
 }
 
 /**
- * AST-only check: Detects expandable strings (double-quoted) with embedded
- * expressions like "$env:PATH" or "$(dangerous-command)". These can hide
- * command execution or variable interpolation inside string literals.
+ * 检查双引号可展开字符串是否嵌入表达式。
+ *
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 字符串中存在变量或命令表达式展开时返回 ask。
  */
 function checkExpandableStrings(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. 可展开字符串会在运行时求值，可能隐藏变量读取或命令执行。
   if (deriveSecurityFlags(parsed).hasExpandableStrings) {
     return {
       behavior: 'ask',
@@ -741,11 +678,15 @@ function checkExpandableStrings(
 }
 
 /**
- * AST-only check: Detects splatting (@variable) which can obscure arguments.
+ * 检查是否使用 splatting 传参。
+ *
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 出现 `@variable` 参数展开时返回 ask。
  */
 function checkSplatting(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. splatting 会把真实参数藏在变量里，静态规则无法直接验证参数内容。
   if (deriveSecurityFlags(parsed).hasSplatting) {
     return {
       behavior: 'ask',
@@ -756,11 +697,15 @@ function checkSplatting(
 }
 
 /**
- * AST-only check: Detects stop-parsing token (--%) which prevents further parsing.
+ * 检查是否使用 PowerShell stop-parsing token。
+ *
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 出现 `--%` 时返回 ask。
  */
 function checkStopParsing(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. stop-parsing 会阻止后续参数被 PowerShell 正常解析，降低静态校验可信度。
   if (deriveSecurityFlags(parsed).hasStopParsing) {
     return {
       behavior: 'ask',
@@ -771,11 +716,15 @@ function checkStopParsing(
 }
 
 /**
- * AST-only check: Detects .NET method invocations which can access system APIs.
+ * 检查是否调用 .NET 成员方法。
+ *
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 出现实例或静态成员调用时返回 ask。
  */
 function checkMemberInvocations(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. .NET 方法可能访问文件、进程、网络等系统 API，不能只按 cmdlet allowlist 放行。
   if (deriveSecurityFlags(parsed).hasMemberInvocations) {
     return {
       behavior: 'ask',
@@ -786,21 +735,15 @@ function checkMemberInvocations(
 }
 
 /**
- * AST-only check: type literals outside Microsoft's ConstrainedLanguage
- * allowlist. CLM blocks all .NET type access except ~90 primitives/attributes
- * Microsoft considers safe for untrusted code. We trust that list as the
- * "safe" boundary — anything outside it (Reflection.Assembly, IO.Pipes,
- * Diagnostics.Process, InteropServices.Marshal, etc.) can access system APIs
- * that compromise the permission model.
+ * 检查类型字面量是否超出 PowerShell 受限语言模式允许范围。
  *
- * Runs AFTER checkMemberInvocations: that broadly flags any ::Method / .Method()
- * call; this check is the more specific "which types" signal. Both fire on
- * [Reflection.Assembly]::Load; CLM gives the precise message. Pure type casts
- * like [int]$x have no member invocation and only hit this check.
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 发现 CLM allowlist 外的 .NET 类型时返回 ask。
  */
 function checkTypeLiterals(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. 类型字面量按 CLM allowlist 逐个校验，允许基础类型转换但拦截系统 API 类型。
   for (const t of parsed.typeLiterals ?? []) {
     if (!isClmAllowedType(t)) {
       return {
@@ -813,15 +756,15 @@ function checkTypeLiterals(
 }
 
 /**
- * Invoke-Item (alias ii) opens a file with its default handler (ShellExecute
- * on Windows, open/xdg-open on Unix). On an .exe/.ps1/.bat/.cmd this is RCE.
- * Bug 008: ii is in no blocklist; passthrough prompt doesn't explain the
- * exec hazard. Always ask — there is no safe variant (even opening .txt may
- * invoke a user-configured handler that accepts arguments).
+ * 检查 `Invoke-Item` 是否通过系统默认处理器打开文件。
+ *
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 命中 `Invoke-Item` 或 `ii` 时返回 ask。
  */
 function checkInvokeItem(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. 默认处理器可能执行可执行文件或用户配置的处理程序，因此统一询问用户。
   for (const cmd of getAllCommands(parsed)) {
     const lower = cmd.name.toLowerCase()
     if (lower === 'invoke-item' || lower === 'ii') {
@@ -836,10 +779,9 @@ function checkInvokeItem(
 }
 
 /**
- * Scheduled-task persistence primitives. Register-ScheduledJob was blocked
- * (DANGEROUS_SCRIPT_BLOCK_CMDLETS); the newer Register-ScheduledTask cmdlet
- * and legacy schtasks.exe /create were not. Persistence that survives the
- * session with no explanatory prompt.
+ * 计划任务相关持久化 cmdlet 集合。
+ *
+ * 这些命令可以创建或修改跨会话保留的任务，是典型持久化入口。
  */
 const SCHEDULED_TASK_CMDLETS = new Set([
   'register-scheduledtask',
@@ -848,9 +790,16 @@ const SCHEDULED_TASK_CMDLETS = new Set([
   'set-scheduledtask',
 ])
 
+/**
+ * 检查是否创建或修改计划任务。
+ *
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 命中计划任务 cmdlet 或 schtasks 创建/修改参数时返回 ask。
+ */
 function checkScheduledTask(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. PowerShell 计划任务 cmdlet 直接按名称拦截。
   for (const cmd of getAllCommands(parsed)) {
     const lower = cmd.name.toLowerCase()
     if (SCHEDULED_TASK_CMDLETS.has(lower)) {
@@ -859,6 +808,7 @@ function checkScheduledTask(
         message: `${cmd.name} creates or modifies a scheduled task (persistence primitive)`,
       }
     }
+    // 2. schtasks.exe 只有 create/change 会修改持久化任务，其他查询类用法不在这里处理。
     if (lower === 'schtasks' || lower === 'schtasks.exe') {
       if (
         cmd.args.some(a => {
@@ -883,7 +833,9 @@ function checkScheduledTask(
 }
 
 /**
- * AST-only check: Detects environment variable manipulation via Set-Item/New-Item on env: scope.
+ * 会写入 `env:` 作用域的 cmdlet 或别名集合。
+ *
+ * 该集合用于判断命令是否可能修改后续进程或工具调用继承到的环境变量。
  */
 const ENV_WRITE_CMDLETS = new Set([
   'set-item',
@@ -900,19 +852,26 @@ const ENV_WRITE_CMDLETS = new Set([
   'clear-item',
   'cli',
   'set-content',
-  // 'sc' omitted — collides with sc.exe on PS Core 7+, see COMMON_ALIASES note
+  // `sc` 在 PS Core 7+ 中容易和 sc.exe 冲突，因此不按 Set-Content 别名处理。
   'add-content',
   'ac',
 ])
 
+/**
+ * 检查命令是否修改环境变量。
+ *
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 发现 env: 作用域写操作或赋值时返回 ask。
+ */
 function checkEnvVarManipulation(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. 没有 env: 变量引用时，不需要检查环境变量写入规则。
   const envVars = getVariablesByScope(parsed, 'env')
   if (envVars.length === 0) {
     return { behavior: 'passthrough' }
   }
-  // Check if any command is a write cmdlet
+  // 2. 对 env: 作用域配合写入类 cmdlet 的情况进行拦截。
   for (const cmd of getAllCommands(parsed)) {
     if (ENV_WRITE_CMDLETS.has(cmd.name.toLowerCase())) {
       return {
@@ -921,7 +880,7 @@ function checkEnvVarManipulation(
       }
     }
   }
-  // Also flag if there are assignments involving env vars
+  // 3. 赋值语句同样会修改 env: 变量，即使没有显式写入 cmdlet。
   if (deriveSecurityFlags(parsed).hasAssignments && envVars.length > 0) {
     return {
       behavior: 'ask',
@@ -932,20 +891,15 @@ function checkEnvVarManipulation(
 }
 
 /**
- * Module-loading cmdlets execute a .psm1's top-level script body (Import-Module)
- * or download from arbitrary repositories (Install-Module, Save-Module). A
- * wildcard allow rule like `Import-Module:*` would let an attacker-supplied
- * .psm1 execute with the user's privileges — same risk as Invoke-Expression.
+ * 检查是否加载、安装或保存 PowerShell 模块。
  *
- * NEVER_SUGGEST (dangerousCmdlets.ts) derives from this list so the UI
- * never offers these as wildcard suggestions, but users can still manually
- * write allow rules. This check ensures the permission engine independently
- * gates these cmdlets.
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 命中模块加载类 cmdlet 时返回 ask。
  */
-
 function checkModuleLoading(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. 模块文件可能在导入时执行顶层脚本，安装/保存模块还可能从远端仓库获取内容。
   for (const cmd of getAllCommands(parsed)) {
     const lower = cmd.name.toLowerCase()
     if (MODULE_LOADING_CMDLETS.has(lower)) {
@@ -960,13 +914,9 @@ function checkModuleLoading(
 }
 
 /**
- * Set-Alias/New-Alias can hijack future command resolution: after
- * `Set-Alias Get-Content Invoke-Expression`, any later `Get-Content $x`
- * executes arbitrary code. Set-Variable/New-Variable can poison
- * `$PSDefaultParameterValues` (e.g., `Set-Variable PSDefaultParameterValues
- * @{'*:Path'='/etc/passwd'}`) which alters every subsequent cmdlet's behavior.
- * Neither effect can be validated statically — we'd need to track all future
- * command resolutions in the session. Always ask.
+ * 会改变后续命令解析或默认参数的运行时状态 cmdlet 集合。
+ *
+ * 这些操作会影响当前会话之后的命令行为，单次命令静态分析无法完整追踪。
  */
 const RUNTIME_STATE_CMDLETS = new Set([
   'set-alias',
@@ -979,11 +929,17 @@ const RUNTIME_STATE_CMDLETS = new Set([
   'nv',
 ])
 
+/**
+ * 检查是否修改别名或变量等运行时状态。
+ *
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 命中运行时状态修改 cmdlet 时返回 ask。
+ */
 function checkRuntimeStateManipulation(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. 支持带模块限定名前缀的命令，先截取最后一级命令名再匹配。
   for (const cmd of getAllCommands(parsed)) {
-    // Strip module qualifier: `Microsoft.PowerShell.Utility\Set-Alias` → `set-alias`
     const raw = cmd.name.toLowerCase()
     const lower = raw.includes('\\')
       ? raw.slice(raw.lastIndexOf('\\') + 1)
@@ -1000,12 +956,9 @@ function checkRuntimeStateManipulation(
 }
 
 /**
- * Invoke-WmiMethod / Invoke-CimMethod are Start-Process equivalents via WMI.
- * `Invoke-WmiMethod -Class Win32_Process -Name Create -ArgumentList "cmd /c ..."`
- * spawns an arbitrary process, bypassing checkStartProcess entirely. No narrow
- * safe usage exists — -Class and -MethodName accept arbitrary strings, so
- * gating on Win32_Process specifically would miss -Class $x or other process-
- * spawning WMI classes. Returns ask on any invocation. (security finding #34)
+ * 可通过 WMI/CIM 触发进程创建的 cmdlet 集合。
+ *
+ * 这些入口可以绕过 `Start-Process` 规则启动任意进程，因此统一询问用户。
  */
 const WMI_SPAWN_CMDLETS = new Set([
   'invoke-wmimethod',
@@ -1013,9 +966,16 @@ const WMI_SPAWN_CMDLETS = new Set([
   'invoke-cimmethod',
 ])
 
+/**
+ * 检查是否通过 WMI/CIM 调用进程创建能力。
+ *
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 命中相关 WMI/CIM cmdlet 时返回 ask。
+ */
 function checkWmiProcessSpawn(
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
+  // 1. WMI/CIM 方法名和类名可能来自动态字符串，窄匹配 Win32_Process 并不可靠。
   for (const cmd of getAllCommands(parsed)) {
     const lower = cmd.name.toLowerCase()
     if (WMI_SPAWN_CMDLETS.has(lower)) {
@@ -1029,21 +989,17 @@ function checkWmiProcessSpawn(
 }
 
 /**
- * Main entry point for PowerShell security validation.
- * Checks a PowerShell command against known dangerous patterns.
+ * 对 PowerShell 命令执行安全规则总检查。
  *
- * All checks are AST-based. If the AST parse failed (parsed.valid === false),
- * none of the individual checks will match and we return 'ask' as a safe default.
- *
- * @param command - The PowerShell command to validate (unused, kept for API compat)
- * @param parsed - Parsed AST from PowerShell's native parser (required)
- * @returns Security result indicating whether the command is safe
+ * @param command 原始 PowerShell 命令；当前保留用于兼容调用签名。
+ * @param parsed PowerShell 原生 AST 转换后的命令结构。
+ * @returns 首个命中的风险规则结果；全部规则通过时返回 passthrough。
  */
 export function powershellCommandIsSafe(
   _command: string,
   parsed: ParsedPowerShellCommand,
 ): PowerShellSecurityResult {
-  // If the AST parse failed, we cannot determine safety -- ask the user
+  // 1. AST 解析失败时无法证明命令安全，默认交给用户确认。
   if (!parsed.valid) {
     return {
       behavior: 'ask',
@@ -1051,6 +1007,7 @@ export function powershellCommandIsSafe(
     }
   }
 
+  // 2. 按从高危显式模式到通用 AST 标志的顺序组织规则，方便返回更准确的提示。
   const validators = [
     checkInvokeExpression,
     checkDynamicCommandName,
@@ -1078,6 +1035,7 @@ export function powershellCommandIsSafe(
     checkWmiProcessSpawn,
   ]
 
+  // 3. 命中第一个需要用户确认的规则后立即返回，避免后续规则覆盖更具体的原因。
   for (const validator of validators) {
     const result = validator(parsed)
     if (result.behavior === 'ask') {
@@ -1085,6 +1043,6 @@ export function powershellCommandIsSafe(
     }
   }
 
-  // All checks passed
+  // 4. 所有规则都未命中时，交给权限 allowlist 或其他外层策略继续处理。
   return { behavior: 'passthrough' }
 }
